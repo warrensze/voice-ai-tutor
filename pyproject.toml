@@ -19,6 +19,9 @@ dependencies = [
     "langchain-community",
     "langchain-text-splitters",
     "pypdf",
+    "pypdfium2",
+    "pytesseract",
+    "pillow",
     "sounddevice",
     "numpy",
 ]
@@ -31,8 +34,14 @@ package-dir = {"" = "src"}
 py-modules = [
     "main",
     "voice_agent",
+    "router_agent",
+    "history_agent",
+    "chemistry_agent",
+    "math_agent",
+    "english_agent",
     "stt_module",
     "tts_module",
+    "voice_config",
     "vector",
     "conversation_utils",
 ]

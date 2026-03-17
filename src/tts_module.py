@@ -59,7 +59,10 @@ class TextToSpeech:
         voice_aliases = {
             "af_heart": ["zira", "aria", "female"],
             "af_bella": ["zira", "female"],
+            "af_sarah": ["zira", "aria", "female"],
+            "af_nicole": ["zira", "female"],
             "am_adam": ["david", "mark", "male"],
+            "am_michael": ["david", "mark", "male"],
         }
         requested = (self.voice or "").lower()
         preferred_tokens = voice_aliases.get(requested, [requested])

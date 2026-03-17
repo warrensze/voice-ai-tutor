@@ -8,9 +8,12 @@ except ImportError:  # pragma: no cover - msvcrt is Windows-only
 from langchain_ollama import ChatOllama
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
+from chemistry_agent import build_chemistry_chain
+from english_agent import build_english_chain
+from history_agent import build_history_chain
+from math_agent import build_math_chain
+from router_agent import route_subject
 
 from conversation_utils import (
     barge_in_passes_threshold as _barge_in_passes_threshold,
@@ -22,32 +25,16 @@ from conversation_utils import (
 from stt_module import SpeechToText
 from tts_module import TextToSpeech
 from vector import search_documents
+from voice_config import load_subject_voice_map
 
 MODEL_NAME = "llama3.1:8b"
-
-SYSTEM_PROMPT = """You are the best high school tutor in the world. You are super friendly 
-and want to ensure your students learn.
-
-Reference the supplied source material. If the source material is empty or does not support
-the answer, say so clearly. Keep answers concise and cite page labels in parentheses when
-available (for example, (page 11)).
-
-Requested page range: {page_range}
-
-Conversation memory:
-{memory_context}
-
-Relevant source material:
-{source}
-
-Student question: {question}
-"""
 
 VOICE_STOP_WORDS = {"quit", "stop", "exit", "bye"}
 BARGE_IN_IDLE_SECONDS = 0.8
 BARGE_IN_MIN_CHARS = 3
 MEMORY_MAX_TURNS = 8
 MEMORY_MAX_CHARS_PER_MESSAGE = 500
+SUPPORTED_SUBJECTS = ("history", "chemistry", "math", "english")
 
 
 def keyboard_quit_requested() -> bool:
@@ -73,18 +60,37 @@ class VoiceAgent:
         """Initialize speech components, memory buffer, and the chat model."""
         self.ears = SpeechToText()
         self.mouth = TextToSpeech()
-        self.memory = InMemoryChatMessageHistory()
+        self.memories = {
+            subject: InMemoryChatMessageHistory() for subject in SUPPORTED_SUBJECTS
+        }
         self.llm = ChatOllama(model=MODEL_NAME, streaming=True, temperature=0.7)
-        self.prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
+        self.specialist_chains = {
+            "history": build_history_chain(self.llm),
+            "chemistry": build_chemistry_chain(self.llm),
+            "math": build_math_chain(self.llm),
+            "english": build_english_chain(self.llm),
+        }
+        self.subject_voice_map = load_subject_voice_map()
         self.source_orchestrator = RunnableLambda(self._orchestrate_chain_inputs)
-        self.response_chain = self.prompt | self.llm | StrOutputParser()
+
+    def _set_subject_voice(self, subject: str):
+        """Apply per-subject voice settings before speaking the response."""
+        selected_subject = subject if subject in self.subject_voice_map else "english"
+        selected_voice = self.subject_voice_map.get(selected_subject)
+        if selected_voice:
+            self.mouth.set_voice(selected_voice)
 
     def _orchestrate_chain_inputs(self, payload: dict) -> dict:
         """Resolve retrieval and prompt context for a single user question."""
         question = str(payload.get("question") or "").strip()
+        subject = str(payload.get("subject") or route_subject(question))
+        if subject not in self.memories:
+            subject = "english"
+
         start_page, end_page = extract_page_range(question)
         source_documents = search_documents(
             question,
+            subject=subject,
             start_page=start_page,
             end_page=end_page,
             k=5,
@@ -93,23 +99,26 @@ class VoiceAgent:
 
         return {
             "question": question,
+            "subject": subject,
             "source": source,
             "page_range": describe_page_range(start_page, end_page),
-            "memory_context": self._memory_context(),
+            "memory_context": self._memory_context(subject),
         }
 
-    def _remember_turn(self, user_input: str, assistant_output: str):
-        """Persist a completed turn into LangChain message history."""
+    def _remember_turn(self, user_input: str, assistant_output: str, subject: str):
+        """Persist a completed turn into the selected specialist memory."""
+        memory = self.memories.get(subject, self.memories["english"])
         user_text = truncate_text(user_input.strip(), MEMORY_MAX_CHARS_PER_MESSAGE)
         assistant_text = truncate_text(
             assistant_output.strip(), MEMORY_MAX_CHARS_PER_MESSAGE
         )
-        self.memory.add_message(HumanMessage(content=user_text))
-        self.memory.add_message(AIMessage(content=assistant_text))
+        memory.add_message(HumanMessage(content=user_text))
+        memory.add_message(AIMessage(content=assistant_text))
 
-    def _memory_context(self) -> str:
-        """Return compact memory text from recent LangChain message history."""
-        recent_messages = self.memory.messages[-(MEMORY_MAX_TURNS * 2) :]
+    def _memory_context(self, subject: str) -> str:
+        """Return compact memory text from the selected specialist history."""
+        memory = self.memories.get(subject, self.memories["english"])
+        recent_messages = memory.messages[-(MEMORY_MAX_TURNS * 2) :]
         if not recent_messages:
             return "No prior conversation yet."
 
@@ -147,9 +156,21 @@ class VoiceAgent:
                 stop_event.set()
                 return
 
-    def _stream_response_with_barge_in(self, user_input: str) -> tuple[str, str | None]:
+    def _stream_response_with_barge_in(
+        self, user_input: str
+    ) -> tuple[str, str | None, str]:
         """Stream model output, speak in chunks, and allow real-time interruption."""
-        chain_inputs = self.source_orchestrator.invoke({"question": user_input})
+        subject = route_subject(user_input)
+        chain_inputs = self.source_orchestrator.invoke(
+            {"question": user_input, "subject": subject}
+        )
+        active_subject = str(chain_inputs.get("subject") or "english")
+        specialist_chain = self.specialist_chains.get(
+            active_subject, self.specialist_chains["english"]
+        )
+        self._set_subject_voice(active_subject)
+
+        print(f"[Agent] {active_subject.capitalize()} specialist")
         print(f"[Sources] {chain_inputs['page_range']}")
         print("AI: ", end="", flush=True)
 
@@ -165,7 +186,7 @@ class VoiceAgent:
         barge_thread.start()
 
         try:
-            for chunk in self.response_chain.stream(chain_inputs):
+            for chunk in specialist_chain.stream(chain_inputs):
                 if keyboard_quit_requested():
                     interrupted["text"] = "quit"
                     barge_stop.set()
@@ -195,14 +216,14 @@ class VoiceAgent:
             self.mouth.stop(wait=False)
             interruption_text = interrupted["text"].strip()
             print(f"\n[Barge-in] {interruption_text}\n")
-            return full_response, interruption_text
+            return full_response, interruption_text, active_subject
 
         if sentence_buffer.strip():
             self.mouth.speak_async(sentence_buffer.strip())
 
         print("\n")
         self.mouth.wait_until_done()
-        return full_response, None
+        return full_response, None, active_subject
 
     def run(self):
         """Run the main conversational loop until the user exits."""
@@ -233,8 +254,8 @@ class VoiceAgent:
                     break
 
                 print(f"\nUser: {user_input}")
-                full_response, interruption_text = self._stream_response_with_barge_in(
-                    user_input
+                full_response, interruption_text, active_subject = (
+                    self._stream_response_with_barge_in(user_input)
                 )
 
                 if interruption_text:
@@ -247,7 +268,11 @@ class VoiceAgent:
                     continue
 
                 if full_response.strip():
-                    self._remember_turn(user_input, full_response.strip())
+                    self._remember_turn(
+                        user_input,
+                        full_response.strip(),
+                        active_subject,
+                    )
 
             except KeyboardInterrupt:
                 print("\nShutting down...")
