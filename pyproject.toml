@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-ai-tutor"
+version = "0.1.0"
+description = "A study tutor that you can talk to"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faster-whisper",
+    "pyttsx3",
+    "soundfile",
+    "langchain",
+    "langchain-ollama",
+    "langchain-core",
+    "langchain-chroma",
+    "langchain-community",
+    "langchain-text-splitters",
+    "pypdf",
+    "sounddevice",
+    "numpy",
+]
+
+[project.scripts]
+voice-ai-tutor = "main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+    "main",
+    "voice_agent",
+    "stt_module",
+    "tts_module",
+    "vector",
+    "conversation_utils",
+]
