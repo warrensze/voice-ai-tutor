@@ -58,8 +58,10 @@ class VoiceAgent:
 
     def __init__(self):
         """Initialize speech components, memory buffer, and the chat model."""
-        self.ears = SpeechToText()
         self.mouth = TextToSpeech()
+        self.ears = SpeechToText(
+            tts_instance=self.mouth
+        )  # Pass TTS reference to prevent self-pickup
         self.memories = {
             subject: InMemoryChatMessageHistory() for subject in SUPPORTED_SUBJECTS
         }
@@ -96,6 +98,14 @@ class VoiceAgent:
             k=5,
         )
         source = format_source(source_documents)
+
+        # Log which filters were applied
+        filter_info = f"subject={subject}"
+        if start_page is not None or end_page is not None:
+            page_desc = describe_page_range(start_page, end_page)
+            filter_info += f", {page_desc.lower()}"
+        if source_documents:
+            filter_info += f" (found {len(source_documents)} results)"
 
         return {
             "question": question,
@@ -141,20 +151,29 @@ class VoiceAgent:
     def _listen_for_barge_in(self, stop_event: threading.Event, shared_state: dict):
         """Listen in short windows for interruption speech while tutor is speaking."""
         while not stop_event.is_set():
-            heard = self.ears.listen(
-                max_idle_seconds=BARGE_IN_IDLE_SECONDS,
-                announce=False,
-                silence_chunks_to_stop=8,
-                beam_size=1,
-            )
-            if stop_event.is_set():
-                return
-            if heard and barge_in_passes_threshold(heard):
-                # Stop speech output immediately so the user can take the floor.
-                self.mouth.stop(wait=False)
-                shared_state["text"] = heard.strip()
-                stop_event.set()
-                return
+            try:
+                heard = self.ears.listen(
+                    max_idle_seconds=BARGE_IN_IDLE_SECONDS,
+                    announce=False,
+                    silence_chunks_to_stop=6,  # More responsive to short interruptions
+                    beam_size=1,
+                )
+                if stop_event.is_set():
+                    return
+
+                # Even single words or short utterances should be treated as interrupts
+                if heard and len(heard.strip()) > 1:
+                    if barge_in_passes_threshold(heard):
+                        # Stop speech output immediately so the user can take the floor.
+                        self.mouth.stop(wait=False)
+                        shared_state["text"] = heard.strip()
+                        stop_event.set()
+                        return
+            except Exception:
+                # Continue listening even if there's an error
+                if stop_event.is_set():
+                    return
+                continue
 
     def _stream_response_with_barge_in(
         self, user_input: str
@@ -231,6 +250,8 @@ class VoiceAgent:
         print("Voice conversation is active. Say 'quit'/'stop' or press 'q' to end.\n")
 
         pending_user_input = None
+        empty_listen_count = 0
+        use_keyboard_fallback = False
 
         while True:
             try:
@@ -243,9 +264,27 @@ class VoiceAgent:
                     user_input = pending_user_input
                     pending_user_input = None
                 else:
-                    user_input = self.ears.listen()
+                    if use_keyboard_fallback:
+                        # Fallback to keyboard input if audio keeps failing
+                        user_input = input(
+                            "\n[Keyboard Input] Enter your question: "
+                        ).strip()
+                    else:
+                        user_input = self.ears.listen(announce=False)
+                        # Track empty returns to detect missing audio device
+                        if not user_input:
+                            empty_listen_count += 1
+                            if empty_listen_count > 5:
+                                print(
+                                    "\n[Warning] No audio input detected after 5 attempts."
+                                )
+                                print("[Switching to keyboard input mode]")
+                                use_keyboard_fallback = True
+                                continue
+                        else:
+                            empty_listen_count = 0
+
                     if not user_input or len(user_input) < 2:
-                        print("No clear speech detected.")
                         continue
 
                 if user_input.strip().lower() in VOICE_STOP_WORDS:

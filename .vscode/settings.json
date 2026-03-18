@@ -1,4 +1,10 @@
 {
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv312/Scripts/python.exe",
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.env.windows": {
+        "VIRTUAL_ENV": "${workspaceFolder}\\.venv312",
+        "PATH": "${workspaceFolder}\\.venv312\\Scripts;${env:PATH}"
+    },
     "python-envs.pythonProjects": [
         {
             "path": ".",

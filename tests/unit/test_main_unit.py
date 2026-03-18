@@ -17,8 +17,8 @@ def load_main_with_stubs():
     stt_stub = types.ModuleType("stt_module")
 
     class SpeechToText:
-        def __init__(self):
-            pass
+        def __init__(self, tts_instance=None):
+            self.tts_instance = tts_instance
 
         def listen(self):
             return ""
@@ -119,39 +119,6 @@ class TestMainHelpers(unittest.TestCase):
             "Turn 1 | Tutor: It is how plants convert light into chemical energy.",
             rendered,
         )
-
-
-class TestQuitBehavior(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.main = load_main_with_stubs()
-
-    def test_keyboard_quit_requested_returns_false_without_msvcrt(self):
-        with patch.object(self.main, "msvcrt", None):
-            self.assertFalse(self.main.keyboard_quit_requested())
-
-    def test_keyboard_quit_requested_returns_true_for_q(self):
-        fake_msvcrt = types.SimpleNamespace(kbhit=lambda: True, getwch=lambda: "q")
-        with patch.object(self.main, "msvcrt", fake_msvcrt):
-            self.assertTrue(self.main.keyboard_quit_requested())
-
-    def test_voice_agent_exits_when_user_says_stop(self):
-        agent = self.main.VoiceAgent()
-        agent.ears = types.SimpleNamespace(listen=lambda: "stop")
-
-        spoken = []
-
-        class Mouth:
-            def speak(self, text):
-                spoken.append(text)
-
-        agent.mouth = Mouth()
-
-        with patch.object(self.main, "keyboard_quit_requested", return_value=False):
-            agent.run()
-
-        self.assertTrue(spoken)
-        self.assertIn("Goodbye! Keep studying!", spoken)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import re
+import shutil
 
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
@@ -141,18 +142,20 @@ def load_and_split_pdf(
 
     # Preserve page numbers
     final_chunks = []
-    for page in pages:
+    for page_idx, page in enumerate(pages):
         chunks = text_splitter.split_text(page.page_content)
         for chunk in chunks:
             metadata = {**page.metadata}
             metadata["subject"] = subject
             metadata["source_file"] = source_file
             metadata["ingest_key"] = ingest_key
-            if "page" in metadata and "page_label" not in metadata:
-                metadata["page_label"] = str(int(metadata["page"]) + 1)
+            # Always use page_idx (0-based) directly for proper filtering
+            metadata["page"] = page_idx
+            # Add human-readable page label (1-based)
+            metadata["page_label"] = str(page_idx + 1)
+
             final_chunks.append(Document(page_content=chunk, metadata=metadata))
 
-    # chunks = text_splitter.split_documents(documents)
     return final_chunks
 
 
@@ -222,7 +225,10 @@ def load_and_split_ocr_text(
 
 
 def build_page_filter(start_page: int | None = None, end_page: int | None = None):
-    """Build an optional page filter for vector similarity search."""
+    """Build an optional page filter for vector similarity search.
+
+    Page numbers are 1-based for user input, but stored as 0-based in metadata.
+    """
     if start_page is None and end_page is None:
         return None
 
@@ -237,10 +243,14 @@ def build_page_filter(start_page: int | None = None, end_page: int | None = None
     if start_page > end_page:
         raise ValueError("start_page must be less than or equal to end_page.")
 
+    # Convert 1-based user page numbers to 0-based storage format
+    start_page_zero_based = start_page - 1
+    end_page_zero_based = end_page - 1
+
     return {
         "$and": [
-            {"page": {"$gte": start_page - 1}},
-            {"page": {"$lte": end_page - 1}},
+            {"page": {"$gte": start_page_zero_based}},
+            {"page": {"$lte": end_page_zero_based}},
         ]
     }
 
@@ -321,7 +331,15 @@ def ingest_subject_documents(vector_store: Chroma):
                 continue
 
         for start in range(0, len(chunks), UPSERT_BATCH_SIZE):
-            vector_store.add_documents(chunks[start : start + UPSERT_BATCH_SIZE])
+            batch = chunks[start : start + UPSERT_BATCH_SIZE]
+            # Log page metadata for first chunk to verify storage
+            if start == 0 and batch:
+                first_chunk = batch[0]
+                page_info = f"page={first_chunk.metadata.get('page')}, page_label={first_chunk.metadata.get('page_label')}"
+                print(
+                    f"[Vector]   Indexing {len(batch)} chunks - sample metadata: {page_info}"
+                )
+            vector_store.add_documents(batch)
         print(
             f"[Vector] Indexed {len(chunks)} chunks from {pdf_path.name} ({subject})."
         )
@@ -334,8 +352,47 @@ def get_vector_store() -> Chroma:
         persist_directory=DB_LOCATION,
         embedding_function=embeddings,
     )
+
+    # Validate and repair page metadata if needed
+    _validate_and_repair_page_metadata(vector_store)
+
     ingest_subject_documents(vector_store)
     return vector_store
+
+
+def _validate_and_repair_page_metadata(vector_store: Chroma):
+    """Check if existing chunks have proper page metadata; repair if missing."""
+    try:
+        # Get a sample of existing records to check metadata
+        sample = vector_store.get(limit=5, include=["metadatas"])
+        if not sample.get("metadatas"):
+            return  # Empty database, nothing to validate
+
+        # Check if any records lack proper page field
+        has_missing_pages = False
+        for metadata in sample["metadatas"]:
+            if metadata and "page" not in metadata:
+                has_missing_pages = True
+                break
+
+        if has_missing_pages:
+            print(
+                "[Vector] Detected missing page metadata in vector database. "
+                "Clearing old data to rebuild with proper page storage."
+            )
+            # Clear the database - it will be rebuilt with proper metadata
+            try:
+                db_path = Path(DB_LOCATION)
+                if db_path.exists():
+                    shutil.rmtree(db_path)
+                    print(
+                        "[Vector] Old vector database cleared. Will rebuild on next ingestion."
+                    )
+            except Exception as e:
+                print(f"[Vector] Warning: Could not clear old database: {e}")
+    except Exception:
+        # Silently ignore validation errors
+        pass
 
 
 vector_store = None
@@ -349,29 +406,124 @@ def search_documents(
     end_page: int | None = None,
     k: int = 5,
 ):
+    """Search documents with combined subject and page filters.
+
+    Args:
+        query: Search query text
+        subject: Optional subject filter ('history', 'chemistry', 'math', 'english')
+        start_page: Optional start page (1-based, inclusive)
+        end_page: Optional end page (1-based, inclusive)
+        k: Number of results to return
+
+    Returns:
+        List of matching documents with filters applied
+    """
     global vector_store
     if vector_store is None:
         vector_store = get_vector_store()
 
+    # Build filters
     page_filter = build_page_filter(start_page, end_page)
     subject_filter = build_subject_filter(subject)
     combined_filter = combine_filters(page_filter, subject_filter)
+
+    # Build search kwargs
     search_kwargs = {"k": k}
     if combined_filter is not None:
         search_kwargs["filter"] = combined_filter
+        print(f"[Vector] Applying filter: {combined_filter}")
+    else:
+        print(f"[Vector] No filters applied")
 
-    return vector_store.similarity_search(query, **search_kwargs)
+    # Execute search with filters
+    results = vector_store.similarity_search(query, **search_kwargs)
+
+    # Log results with metadata
+    print(f"[Vector] Found {len(results)} results")
+    for i, doc in enumerate(results, 1):
+        page_label = doc.metadata.get("page_label", "unknown")
+        page_num = doc.metadata.get("page", "unknown")
+        subject_result = doc.metadata.get("subject", "unknown")
+        print(
+            f"[Vector]   Result {i}: page_label={page_label} (page={page_num}), subject={subject_result}"
+        )
+
+    # Validate that filters were actually applied to results
+    if combined_filter is not None:
+        _validate_filter_applied(
+            results, combined_filter, subject, start_page, end_page
+        )
+
+    return results
 
 
-def get_retriever(k: int = 5, subject: str | None = None):
+def _validate_filter_applied(results, filter_spec, subject, start_page, end_page):
+    """Verify that filters were actually applied to search results."""
+    if not results:
+        return  # No results, nothing to validate
+
+    # Check subject filter application
+    if subject:
+        for doc in results:
+            doc_subject = doc.metadata.get("subject", "").lower()
+            if doc_subject and doc_subject != subject.lower():
+                print(
+                    f"[Vector] WARNING: Subject filter not fully applied. "
+                    f"Expected '{subject}' but got '{doc_subject}' in result."
+                )
+                break
+
+    # Check page filter application
+    if start_page is not None or end_page is not None:
+        for doc in results:
+            doc_page = doc.metadata.get("page")
+            if doc_page is not None:
+                page_num_1based = doc_page + 1
+
+                if start_page is not None and page_num_1based < start_page:
+                    print(
+                        f"[Vector] WARNING: Page filter not fully applied. "
+                        f"Result on page {page_num_1based} but start_page is {start_page}."
+                    )
+                    break
+
+                if end_page is not None and page_num_1based > end_page:
+                    print(
+                        f"[Vector] WARNING: Page filter not fully applied. "
+                        f"Result on page {page_num_1based} but end_page is {end_page}."
+                    )
+                    break
+
+
+def get_retriever(
+    k: int = 5,
+    subject: str | None = None,
+    start_page: int | None = None,
+    end_page: int | None = None,
+):
+    """Create a retriever with optional subject and page range filters.
+
+    Args:
+        k: Number of documents to retrieve
+        subject: Subject to filter by (e.g., 'history', 'chemistry', 'math', 'english')
+        start_page: First page number (1-based, inclusive)
+        end_page: Last page number (1-based, inclusive)
+
+    Returns:
+        A LangChain retriever with appropriate filters applied
+    """
     global vector_store
     if vector_store is None:
         vector_store = get_vector_store()
 
-    search_kwargs = {"k": k}
+    # Build filters
+    page_filter = build_page_filter(start_page, end_page)
     subject_filter = build_subject_filter(subject)
-    if subject_filter is not None:
-        search_kwargs["filter"] = subject_filter
+    combined_filter = combine_filters(page_filter, subject_filter)
+
+    search_kwargs = {"k": k}
+    if combined_filter is not None:
+        search_kwargs["filter"] = combined_filter
 
     return vector_store.as_retriever(search_kwargs=search_kwargs)
 
@@ -498,6 +650,122 @@ def print_ingestion_summary():
         )
 
 
+def diagnose_filters():
+    """Test that subject and page filters are working correctly.
+
+    This is a diagnostic function to verify filters are properly applied
+    during vector database retrieval.
+    """
+    global vector_store
+
+    print("\n=== Vector Filter Diagnostic ===\n")
+
+    if vector_store is None:
+        vector_store = get_vector_store()
+
+    # Get summary of database
+    summary = get_ingestion_summary()
+    total_chunks = summary.get("total_chunks", 0)
+
+    if total_chunks == 0:
+        print("No chunks indexed. Cannot run filter diagnostics.")
+        return
+
+    print(f"Total chunks in database: {total_chunks}\n")
+
+    # Test 1: Subject filter
+    print("TEST 1: Subject filtering")
+    for subject in ["history", "chemistry", "math", "english"]:
+        results = search_documents("sample query", subject=subject, k=5)
+        if results:
+            # Verify all results match the subject filter
+            all_match = all(
+                doc.metadata.get("subject", "").lower() == subject.lower()
+                for doc in results
+            )
+            status = "✓ PASS" if all_match else "✗ FAIL"
+            print(
+                f"  {status}: {subject.upper()} - found {len(results)} results, all match={all_match}"
+            )
+        else:
+            print(f"  - {subject.upper()} - no results")
+
+    # Test 2: Page filtering
+    print("\nTEST 2: Page range filtering")
+
+    # Get sample pages from database
+    try:
+        all_metadata = vector_store.get(include=["metadatas"], limit=100)
+        pages_in_db = set()
+        for metadata in all_metadata.get("metadatas", []):
+            if metadata and "page" in metadata:
+                pages_in_db.add(int(metadata["page"]) + 1)  # Convert to 1-based
+
+        if pages_in_db:
+            min_page = min(pages_in_db)
+            max_page = max(pages_in_db)
+            print(f"  Pages in database: {min_page} to {max_page}")
+
+            # Test a specific page range
+            test_start = min_page
+            test_end = min(min_page + 2, max_page)
+
+            results = search_documents(
+                "sample query", start_page=test_start, end_page=test_end, k=10
+            )
+
+            if results:
+                all_in_range = all(
+                    test_start <= (doc.metadata.get("page", 0) + 1) <= test_end
+                    for doc in results
+                )
+                status = "✓ PASS" if all_in_range else "✗ FAIL"
+                print(
+                    f"  {status}: Pages {test_start}-{test_end} - found {len(results)} results, all in range={all_in_range}"
+                )
+            else:
+                print(f"  - Pages {test_start}-{test_end} - no results")
+        else:
+            print("  No page metadata found in database")
+    except Exception as e:
+        print(f"  Error testing page filtering: {e}")
+
+    # Test 3: Combined filters
+    print("\nTEST 3: Combined subject + page filtering")
+
+    try:
+        # Get a subject with pages
+        summary = get_ingestion_summary()
+        subjects = summary.get("subjects", {})
+
+        if subjects:
+            test_subject = list(subjects.keys())[0]
+            results = search_documents(
+                "sample query", subject=test_subject, start_page=1, end_page=5, k=10
+            )
+
+            if results:
+                subject_match = all(
+                    doc.metadata.get("subject", "").lower() == test_subject.lower()
+                    for doc in results
+                )
+                page_match = all(
+                    1 <= (doc.metadata.get("page", 0) + 1) <= 5
+                    for doc in results
+                    if "page" in doc.metadata
+                )
+                status = "✓ PASS" if (subject_match and page_match) else "✗ FAIL"
+                print(
+                    f"  {status}: {test_subject.upper()} pages 1-5 - {len(results)} results, subject ok={subject_match}, pages ok={page_match}"
+                )
+            else:
+                print(f"  - No results for {test_subject.upper()} pages 1-5")
+    except Exception as e:
+        print(f"  Error testing combined filters: {e}")
+
+    print("\n=== End of Diagnostic ===\n")
+
+
 def parse_args():
     """Parse CLI args for status and ingestion actions."""
     parser = argparse.ArgumentParser(description="Vector ingestion utilities")
@@ -505,6 +773,11 @@ def parse_args():
         "--ingest",
         action="store_true",
         help="Run embedding-backed ingestion before printing summary.",
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Run filter diagnostics to verify subject and page filtering works.",
     )
     return parser.parse_args()
 
@@ -515,6 +788,8 @@ def main():
     if args.ingest:
         print("Running ingestion (embeddings enabled)...")
         get_vector_store()
+    if args.diagnose:
+        diagnose_filters()
     print_ingestion_summary()
 
 

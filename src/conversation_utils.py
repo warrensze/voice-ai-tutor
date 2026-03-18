@@ -87,4 +87,18 @@ def barge_in_passes_threshold(text: str, stop_words: set[str], min_chars: int) -
     if cleaned.lower() in stop_words:
         return True
 
+    # Filter out utterances that are mostly punctuation or symbols (likely echo/noise)
+    # Keep only alphanumeric characters and count them
+    words = cleaned.split()
+    if not words:
+        return False
+
+    # Count actual word characters vs punctuation
+    alpha_count = sum(1 for c in cleaned if c.isalnum())
+    total_count = len(cleaned)
+
+    # If more than 60% punctuation/spaces, it's likely echo or noise
+    if alpha_count == 0 or (total_count - alpha_count) / total_count > 0.6:
+        return False
+
     return len(cleaned) >= min_chars
