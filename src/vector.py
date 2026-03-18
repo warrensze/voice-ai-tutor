@@ -1,3 +1,12 @@
+# Configure offline-only mode BEFORE any other imports
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 from pathlib import Path
 import argparse
 import re
@@ -416,7 +425,7 @@ def search_documents(
         k: Number of results to return
 
     Returns:
-        List of matching documents with filters applied
+        List of matching documents with filters applied, using fallback strategy if needed
     """
     global vector_store
     if vector_store is None:
@@ -427,7 +436,10 @@ def search_documents(
     subject_filter = build_subject_filter(subject)
     combined_filter = combine_filters(page_filter, subject_filter)
 
-    # Build search kwargs
+    # Track whether page filter was requested for fallback strategy
+    page_filter_requested = start_page is not None or end_page is not None
+
+    # Step 1: Try search with all filters applied
     search_kwargs = {"k": k}
     if combined_filter is not None:
         search_kwargs["filter"] = combined_filter
@@ -447,6 +459,51 @@ def search_documents(
         print(
             f"[Vector]   Result {i}: page_label={page_label} (page={page_num}), subject={subject_result}"
         )
+
+    # Step 2: Fallback strategy - if page filter was requested but returned no results,
+    # retry with higher k and page filter to ensure we find content from those pages
+    if page_filter_requested and len(results) == 0:
+        print(
+            f"[Vector] No results with combined filters. "
+            f"Retrying with page filter and higher k={k * 3}..."
+        )
+        retry_kwargs = {"k": k * 3}
+        if page_filter is not None:
+            retry_kwargs["filter"] = page_filter
+        results = vector_store.similarity_search(query, **retry_kwargs)
+
+        print(f"[Vector] Retry found {len(results)} results with page filter")
+        for i, doc in enumerate(results, 1):
+            page_label = doc.metadata.get("page_label", "unknown")
+            page_num = doc.metadata.get("page", "unknown")
+            subject_result = doc.metadata.get("subject", "unknown")
+            print(
+                f"[Vector]   Retry Result {i}: page_label={page_label} (page={page_num}), subject={subject_result}"
+            )
+
+        # Step 3: If still no results with page filter, return top k results from all pages
+        # to avoid "pages don't exist" when they do
+        if len(results) == 0:
+            print(
+                f"[Vector] Still no results with page filter. "
+                f"Expanding search to all pages to find relevant content..."
+            )
+            expand_kwargs = {"k": k}
+            if subject_filter is not None:
+                expand_kwargs["filter"] = subject_filter
+            results = vector_store.similarity_search(query, **expand_kwargs)
+
+            print(
+                f"[Vector] Expanded search found {len(results)} results "
+                f"(note: these may be outside requested page range)"
+            )
+            for i, doc in enumerate(results, 1):
+                page_label = doc.metadata.get("page_label", "unknown")
+                page_num = doc.metadata.get("page", "unknown")
+                subject_result = doc.metadata.get("subject", "unknown")
+                print(
+                    f"[Vector]   Expanded Result {i}: page_label={page_label} (page={page_num}), subject={subject_result}"
+                )
 
     # Validate that filters were actually applied to results
     if combined_filter is not None:

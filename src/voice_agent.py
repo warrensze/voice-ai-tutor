@@ -1,4 +1,14 @@
+# Configure offline-only mode BEFORE any other imports
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 import threading
+import time
 
 try:
     import msvcrt
@@ -13,7 +23,7 @@ from chemistry_agent import build_chemistry_chain
 from english_agent import build_english_chain
 from history_agent import build_history_chain
 from math_agent import build_math_chain
-from router_agent import route_subject
+from router_agent import route_subject, route_subject_sticky
 
 from conversation_utils import (
     barge_in_passes_threshold as _barge_in_passes_threshold,
@@ -28,10 +38,13 @@ from vector import search_documents
 from voice_config import load_subject_voice_map
 
 MODEL_NAME = "llama3.1:8b"
+DEFAULT_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "220"))
 
 VOICE_STOP_WORDS = {"quit", "stop", "exit", "bye"}
 BARGE_IN_IDLE_SECONDS = 0.8
 BARGE_IN_MIN_CHARS = 3
+BARGE_JOIN_TIMEOUT_SECONDS = 1.2
+PLAYBACK_POLL_SECONDS = 0.05
 MEMORY_MAX_TURNS = 8
 MEMORY_MAX_CHARS_PER_MESSAGE = 500
 SUPPORTED_SUBJECTS = ("history", "chemistry", "math", "english")
@@ -65,7 +78,12 @@ class VoiceAgent:
         self.memories = {
             subject: InMemoryChatMessageHistory() for subject in SUPPORTED_SUBJECTS
         }
-        self.llm = ChatOllama(model=MODEL_NAME, streaming=True, temperature=0.7)
+        self.llm = ChatOllama(
+            model=MODEL_NAME,
+            streaming=True,
+            temperature=0.7,
+            num_predict=DEFAULT_NUM_PREDICT,
+        )
         self.specialist_chains = {
             "history": build_history_chain(self.llm),
             "chemistry": build_chemistry_chain(self.llm),
@@ -74,6 +92,7 @@ class VoiceAgent:
         }
         self.subject_voice_map = load_subject_voice_map()
         self.source_orchestrator = RunnableLambda(self._orchestrate_chain_inputs)
+        self.current_subject = "english"  # Track the current subject for stickiness
 
     def _set_subject_voice(self, subject: str):
         """Apply per-subject voice settings before speaking the response."""
@@ -157,6 +176,7 @@ class VoiceAgent:
                     announce=False,
                     silence_chunks_to_stop=6,  # More responsive to short interruptions
                     beam_size=1,
+                    stop_event=stop_event,
                 )
                 if stop_event.is_set():
                     return
@@ -179,7 +199,18 @@ class VoiceAgent:
         self, user_input: str
     ) -> tuple[str, str | None, str]:
         """Stream model output, speak in chunks, and allow real-time interruption."""
-        subject = route_subject(user_input)
+        # Use sticky subject routing to maintain subject context
+        subject, is_explicit_switch = route_subject_sticky(
+            user_input, self.current_subject
+        )
+
+        # Only log subject switch if it's explicit (user clearly asked for a topic change)
+        if is_explicit_switch:
+            print(f"[Subject Switch] Changed from {self.current_subject} to {subject}")
+
+        # Update current subject for sticky persistence
+        self.current_subject = subject
+
         chain_inputs = self.source_orchestrator.invoke(
             {"question": user_input, "subject": subject}
         )
@@ -227,9 +258,22 @@ class VoiceAgent:
                     if clean_sentence:
                         self.mouth.speak_async(clean_sentence)
                     sentence_buffer = ""
+
+            if sentence_buffer.strip() and not interrupted["text"]:
+                self.mouth.speak_async(sentence_buffer.strip())
+
+            # Keep interruption listening active while queued TTS is still playing.
+            while not interrupted["text"] and self.mouth.has_pending_audio():
+                if keyboard_quit_requested():
+                    interrupted["text"] = "quit"
+                    barge_stop.set()
+                    break
+                if barge_stop.is_set():
+                    break
+                time.sleep(PLAYBACK_POLL_SECONDS)
         finally:
             barge_stop.set()
-            barge_thread.join(timeout=0.2)
+            barge_thread.join(timeout=BARGE_JOIN_TIMEOUT_SECONDS)
 
         if interrupted["text"]:
             self.mouth.stop(wait=False)
@@ -237,11 +281,7 @@ class VoiceAgent:
             print(f"\n[Barge-in] {interruption_text}\n")
             return full_response, interruption_text, active_subject
 
-        if sentence_buffer.strip():
-            self.mouth.speak_async(sentence_buffer.strip())
-
         print("\n")
-        self.mouth.wait_until_done()
         return full_response, None, active_subject
 
     def run(self):
@@ -252,6 +292,8 @@ class VoiceAgent:
         pending_user_input = None
         empty_listen_count = 0
         use_keyboard_fallback = False
+        voice_prompt_shown = False
+        keyboard_prompt_shown = False
 
         while True:
             try:
@@ -263,13 +305,21 @@ class VoiceAgent:
                 if pending_user_input:
                     user_input = pending_user_input
                     pending_user_input = None
+                    voice_prompt_shown = False
+                    keyboard_prompt_shown = False
                 else:
                     if use_keyboard_fallback:
                         # Fallback to keyboard input if audio keeps failing
+                        if not keyboard_prompt_shown:
+                            print("\n[Ready] Listening via keyboard input.")
+                            keyboard_prompt_shown = True
                         user_input = input(
                             "\n[Keyboard Input] Enter your question: "
                         ).strip()
                     else:
+                        if not voice_prompt_shown:
+                            print("\n[Ready] App is ready. [Listening] Speak now...")
+                            voice_prompt_shown = True
                         user_input = self.ears.listen(announce=False)
                         # Track empty returns to detect missing audio device
                         if not user_input:
@@ -280,9 +330,13 @@ class VoiceAgent:
                                 )
                                 print("[Switching to keyboard input mode]")
                                 use_keyboard_fallback = True
+                                voice_prompt_shown = False
+                                keyboard_prompt_shown = False
                                 continue
                         else:
                             empty_listen_count = 0
+                            voice_prompt_shown = False
+                            keyboard_prompt_shown = False
 
                     if not user_input or len(user_input) < 2:
                         continue
@@ -293,6 +347,7 @@ class VoiceAgent:
                     break
 
                 print(f"\nUser: {user_input}")
+                print("[Processing] Thinking...")
                 full_response, interruption_text, active_subject = (
                     self._stream_response_with_barge_in(user_input)
                 )

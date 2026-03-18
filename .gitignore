@@ -1,6 +1,35 @@
 .env
-venv
-.venv
-__pycache__
-mem0_mcp.egg-info
+.env.*
+venv/
+.venv/
+.venv312/
+voice_tutor_env/
+
+# Python caches/build outputs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+mem0_mcp.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Editor/OS
+.vscode/
 .python-version
+
+# Runtime/generated app artifacts
+error.log
+*.log
+chrome_langchain_db/
+.kokoro_assets_*.ready
+
+# Local test/generated artifacts
+test_results.txt

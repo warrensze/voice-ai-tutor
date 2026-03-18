@@ -2,6 +2,7 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 import os
+import threading
 
 # Configuration
 MODEL_SIZE = "base.en"  # 'base.en' is instant; 'distil-large-v3' is higher quality
@@ -134,6 +135,7 @@ class SpeechToText:
         announce: bool = True,
         silence_chunks_to_stop: int = 30,
         beam_size: int = 5,
+        stop_event: threading.Event | None = None,
     ):
         """Capture microphone audio, detect speech, and return transcribed text.
 
@@ -178,6 +180,9 @@ class SpeechToText:
                 device=self.input_device,
             ):
                 while True:
+                    if stop_event is not None and stop_event.is_set():
+                        return np.array([], dtype=np.float32)
+
                     if audio_buffer:
                         if len(audio_buffer) == CALIBRATION_CHUNKS:
                             active_threshold = self._adaptive_threshold(audio_buffer)
@@ -280,6 +285,9 @@ class SpeechToText:
                 return ""
 
         if full_audio.size == 0:
+            return ""
+
+        if stop_event is not None and stop_event.is_set():
             return ""
 
         if capture_rate != self.rate:

@@ -104,6 +104,8 @@ class TextToSpeech:
         self._waveglow_synth = None
         self._waveglow_failed = False  # Track if WaveGlow had a failure
         self._is_playing = threading.Event()  # Track when audio is being played
+        self._max_async_queue = max(1, int(os.getenv("TTS_ASYNC_QUEUE_MAX", "8")))
+        self._max_async_chars = max(40, int(os.getenv("TTS_ASYNC_MAX_CHARS", "320")))
         self._kokoro_repo_id = os.getenv("KOKORO_REPO_ID", "hexgrad/Kokoro-82M")
         self._kokoro_enable_voice_blend = os.getenv(
             "KOKORO_ENABLE_VOICE_BLEND", "0"
@@ -684,16 +686,21 @@ class TextToSpeech:
                 )
                 self._blend_warning_shown = True
 
-        generator = self._kokoro_pipeline(
-            text,
-            voice=selected_voice,
-            speed=self.speed,
-            split_pattern=r"\n+",
-        )
-        for _, _, audio in generator:
-            if self._stop_requested.is_set():
-                return
-            self._play_audio(audio, 24000)
+        try:
+            generator = self._kokoro_pipeline(
+                text,
+                voice=selected_voice,
+                speed=self.speed,
+                split_pattern=r"\n+",
+            )
+            for _, _, audio in generator:
+                if self._stop_requested.is_set():
+                    return
+                self._play_audio(audio, 24000)
+        except Exception as error:
+            print(f"[Mouth] Kokoro playback error: {error}")
+            print("[Mouth] Falling back to pyttsx3 for this response")
+            self._speak_with_engine_chunks(text)
 
     def speak(self, text):
         """Speak text synchronously, replacing any in-flight playback."""
@@ -722,8 +729,19 @@ class TextToSpeech:
         if not text:
             return
 
+        cleaned = str(text).strip()
+        if not cleaned:
+            return
+
+        if len(cleaned) > self._max_async_chars:
+            cleaned = cleaned[: self._max_async_chars].rstrip() + "..."
+
         with self._async_queue_lock:
-            self._async_queue.append(text)
+            self._async_queue.append(cleaned)
+            if len(self._async_queue) > self._max_async_queue:
+                overflow = len(self._async_queue) - self._max_async_queue
+                if overflow > 0:
+                    del self._async_queue[:overflow]
             should_start_worker = (
                 self._speak_thread is None or not self._speak_thread.is_alive()
             )
@@ -743,6 +761,14 @@ class TextToSpeech:
             if not thread or not thread.is_alive():
                 break
             thread.join()
+
+    def has_pending_audio(self) -> bool:
+        """Return True while audio is playing or queued for playback."""
+        thread = self._speak_thread
+        thread_alive = bool(thread and thread.is_alive())
+        with self._async_queue_lock:
+            queue_has_items = bool(self._async_queue)
+        return self._is_playing.is_set() or thread_alive or queue_has_items
 
     def stop(self, wait: bool = True):
         """Stop any active speech output across both supported backends."""

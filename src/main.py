@@ -3,6 +3,20 @@ try:
 except ImportError:  # pragma: no cover - msvcrt is Windows-only
     msvcrt = None
 
+import logging
+
+# Configure offline-only mode to prevent HuggingFace Hub requests
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+# Suppress HF Hub warnings since we're offline-only
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+from crash_logger import setup_crash_logging
+
 from conversation_utils import (
     describe_page_range as _describe_page_range,
     extract_page_range as _extract_page_range,
@@ -14,6 +28,10 @@ from voice_agent import (
     VoiceAgent,
     barge_in_passes_threshold as _barge_in_passes_threshold,
 )
+
+LOG_DIR = setup_crash_logging()
+LOGGER = logging.getLogger("voice_ai_tutor")
+print(f"[Logging] Crash diagnostics enabled. Logs directory: {LOG_DIR}")
 
 
 def describe_page_range(start_page: int | None, end_page: int | None) -> str:
@@ -54,8 +72,15 @@ def barge_in_passes_threshold(text: str) -> bool:
 
 def main():
     """Start the voice tutor application."""
-    agent = VoiceAgent()
-    agent.run()
+    LOGGER.info("Application startup requested")
+    try:
+        agent = VoiceAgent()
+        LOGGER.info("VoiceAgent initialized")
+        agent.run()
+        LOGGER.info("VoiceAgent exited normally")
+    except Exception:
+        LOGGER.exception("Unhandled exception in main application loop")
+        raise
 
 
 if __name__ == "__main__":
