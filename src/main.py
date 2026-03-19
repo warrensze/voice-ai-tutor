@@ -4,6 +4,7 @@ except ImportError:  # pragma: no cover - msvcrt is Windows-only
     msvcrt = None
 
 import logging
+import sys
 
 # Configure offline-only mode to prevent HuggingFace Hub requests
 import os
@@ -32,6 +33,16 @@ from voice_agent import (
 LOG_DIR = setup_crash_logging()
 LOGGER = logging.getLogger("voice_ai_tutor")
 print(f"[Logging] Crash diagnostics enabled. Logs directory: {LOG_DIR}")
+
+if sys.version_info >= (3, 14):
+    message = (
+        "Unsupported Python runtime detected (3.14+). "
+        "Please run with Python 3.12/3.13, for example: "
+        ".\\.venv312\\Scripts\\python.exe src/main.py"
+    )
+    print(f"[Startup Error] {message}")
+    LOGGER.critical(message)
+    raise SystemExit(1)
 
 
 def describe_page_range(start_page: int | None, end_page: int | None) -> str:

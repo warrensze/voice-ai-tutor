@@ -1,6 +1,7 @@
 import re
 import threading
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -88,15 +89,19 @@ class TextToSpeech:
     def __init__(self, voice: str = "af_heart", speed: float = 1.0):
         """Initialize voice settings and select the best available TTS backend."""
         self.rate = 175
-        self.volume = 1.0
+        configured_volume = float(os.getenv("TTS_OUTPUT_VOLUME", "1.0"))
+        self.volume = min(1.0, max(0.0, configured_volume))
         self.voice = voice
         self.speed = speed
+        self.output_gain = max(0.1, float(os.getenv("TTS_OUTPUT_GAIN", "1.0")))
         self._lock = threading.Lock()
+        self._kokoro_lock = threading.Lock()
         self._active_engine = None
         self._stop_requested = threading.Event()
         self._speak_thread = None
         self._async_queue: list[str] = []
         self._async_queue_lock = threading.Lock()
+        self._async_queue_condition = threading.Condition(self._async_queue_lock)
         self._warmup_thread = None
         self._kokoro_pipeline = None
         self._kokoro_assets_ready = False
@@ -104,8 +109,16 @@ class TextToSpeech:
         self._waveglow_synth = None
         self._waveglow_failed = False  # Track if WaveGlow had a failure
         self._is_playing = threading.Event()  # Track when audio is being played
+        self._last_playback_end = 0.0
         self._max_async_queue = max(1, int(os.getenv("TTS_ASYNC_QUEUE_MAX", "8")))
         self._max_async_chars = max(40, int(os.getenv("TTS_ASYNC_MAX_CHARS", "320")))
+        self._async_thread_daemon = os.getenv(
+            "TTS_ASYNC_DAEMON", "0"
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         self._kokoro_repo_id = os.getenv("KOKORO_REPO_ID", "hexgrad/Kokoro-82M")
         self._kokoro_enable_voice_blend = os.getenv(
             "KOKORO_ENABLE_VOICE_BLEND", "0"
@@ -207,20 +220,27 @@ class TextToSpeech:
         if sd is None:
             return
 
+        waveform = np.asarray(audio, dtype=np.float32)
+        if waveform.size == 0:
+            return
+        waveform = np.clip(waveform * self.output_gain, -1.0, 1.0)
+
         device = self._current_output_device()
         try:
             self._is_playing.set()
-            sd.play(audio, sample_rate, device=device)
+            sd.play(waveform, sample_rate, device=device)
             sd.wait()
             self._is_playing.clear()
+            self._last_playback_end = time.monotonic()
             return
         except Exception:
             # Retry on system default in case selected output was unavailable.
             try:
-                sd.play(audio, sample_rate)
+                sd.play(waveform, sample_rate)
                 sd.wait()
             finally:
                 self._is_playing.clear()
+                self._last_playback_end = time.monotonic()
 
     def _configure_backend(self):
         """Select the first available backend from configured backend order."""
@@ -390,6 +410,14 @@ class TextToSpeech:
         """Return True if audio is currently being played through speakers."""
         return self._is_playing.is_set()
 
+    def recently_played(self, window_seconds: float = 0.8) -> bool:
+        """Return True if audio playback ended recently."""
+        if self._is_playing.is_set():
+            return True
+        if self._last_playback_end <= 0:
+            return False
+        return (time.monotonic() - self._last_playback_end) <= max(0.0, window_seconds)
+
     def set_voice(self, new_voice: str):
         """Update the active voice preset used by subsequent speech calls."""
         if not new_voice:
@@ -417,18 +445,19 @@ class TextToSpeech:
             return np.array([], dtype=np.float32)
 
         rendered: list[np.ndarray] = []
-        generator = self._kokoro_pipeline(
-            text,
-            voice=voice,
-            speed=self.speed,
-            split_pattern=r"\n+",
-        )
-        for _, _, audio in generator:
-            if self._stop_requested.is_set():
-                return np.array([], dtype=np.float32)
-            audio_np = np.asarray(audio, dtype=np.float32).flatten()
-            if audio_np.size:
-                rendered.append(audio_np)
+        with self._kokoro_lock:
+            generator = self._kokoro_pipeline(
+                text,
+                voice=voice,
+                speed=self.speed,
+                split_pattern=r"\n+",
+            )
+            for _, _, audio in generator:
+                if self._stop_requested.is_set():
+                    return np.array([], dtype=np.float32)
+                audio_np = np.asarray(audio, dtype=np.float32).flatten()
+                if audio_np.size:
+                    rendered.append(audio_np)
 
         if not rendered:
             return np.array([], dtype=np.float32)
@@ -557,6 +586,75 @@ class TextToSpeech:
             if chunk:
                 yield chunk
 
+    def _split_for_async_queue(self, text: str) -> list[str]:
+        """Split queued text into bounded segments without dropping content."""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return []
+
+        max_chars = self._max_async_chars
+        if len(normalized) <= max_chars:
+            return [normalized]
+
+        segments: list[str] = []
+        sentence_parts = re.split(r"(?<=[.!?])\s+", normalized)
+        if not sentence_parts:
+            sentence_parts = [normalized]
+
+        current = ""
+
+        def flush_current() -> None:
+            nonlocal current
+            if current:
+                segments.append(current)
+                current = ""
+
+        def add_word(word: str) -> None:
+            nonlocal current
+            if not word:
+                return
+
+            if not current:
+                current = word
+                return
+
+            candidate = f"{current} {word}"
+            if len(candidate) <= max_chars:
+                current = candidate
+                return
+
+            flush_current()
+            current = word
+
+        for part in sentence_parts:
+            sentence = part.strip()
+            if not sentence:
+                continue
+
+            words = sentence.split()
+            if not words:
+                continue
+
+            for word in words:
+                if len(word) > max_chars:
+                    flush_current()
+                    start = 0
+                    while start < len(word):
+                        token = word[start : start + max_chars]
+                        if len(token) == max_chars:
+                            segments.append(token)
+                        else:
+                            current = token
+                        start += max_chars
+                    continue
+
+                add_word(word)
+
+            flush_current()
+
+        flush_current()
+        return [segment for segment in segments if segment]
+
     def _speak_with_engine(self, text: str):
         """Speak a single chunk using the pyttsx3 backend."""
         engine = self._create_engine()
@@ -568,6 +666,7 @@ class TextToSpeech:
             engine.runAndWait()
         finally:
             self._is_playing.clear()  # Clear immediately when done
+            self._last_playback_end = time.monotonic()
             with self._lock:
                 self._active_engine = None
             engine.stop()
@@ -687,16 +786,17 @@ class TextToSpeech:
                 self._blend_warning_shown = True
 
         try:
-            generator = self._kokoro_pipeline(
-                text,
-                voice=selected_voice,
-                speed=self.speed,
-                split_pattern=r"\n+",
-            )
-            for _, _, audio in generator:
-                if self._stop_requested.is_set():
-                    return
-                self._play_audio(audio, 24000)
+            with self._kokoro_lock:
+                generator = self._kokoro_pipeline(
+                    text,
+                    voice=selected_voice,
+                    speed=self.speed,
+                    split_pattern=r"\n+",
+                )
+                for _, _, audio in generator:
+                    if self._stop_requested.is_set():
+                        return
+                    self._play_audio(audio, 24000)
         except Exception as error:
             print(f"[Mouth] Kokoro playback error: {error}")
             print("[Mouth] Falling back to pyttsx3 for this response")
@@ -714,15 +814,17 @@ class TextToSpeech:
     def _consume_async_queue(self):
         """Drain queued async speech chunks in order without dropping content."""
         while not self._stop_requested.is_set():
-            with self._async_queue_lock:
+            with self._async_queue_condition:
                 if not self._async_queue:
                     break
                 next_text = self._async_queue.pop(0)
+                self._async_queue_condition.notify_all()
 
             self._speak_chunks(next_text)
 
-        with self._async_queue_lock:
+        with self._async_queue_condition:
             self._speak_thread = None
+            self._async_queue_condition.notify_all()
 
     def speak_async(self, text):
         """Speak text in a background thread so main flow can continue."""
@@ -733,26 +835,35 @@ class TextToSpeech:
         if not cleaned:
             return
 
-        if len(cleaned) > self._max_async_chars:
-            cleaned = cleaned[: self._max_async_chars].rstrip() + "..."
+        segments = self._split_for_async_queue(cleaned)
+        if not segments:
+            return
 
-        with self._async_queue_lock:
-            self._async_queue.append(cleaned)
-            if len(self._async_queue) > self._max_async_queue:
-                overflow = len(self._async_queue) - self._max_async_queue
-                if overflow > 0:
-                    del self._async_queue[:overflow]
+        with self._async_queue_condition:
+            self._stop_requested.clear()
             should_start_worker = (
                 self._speak_thread is None or not self._speak_thread.is_alive()
             )
+            if should_start_worker:
+                self._speak_thread = threading.Thread(
+                    target=self._consume_async_queue,
+                    daemon=self._async_thread_daemon,
+                    name="TTSAsyncWorker",
+                )
+                self._speak_thread.start()
 
-        if should_start_worker:
-            self._stop_requested.clear()
-            self._speak_thread = threading.Thread(
-                target=self._consume_async_queue,
-                daemon=True,
-            )
-            self._speak_thread.start()
+            for segment in segments:
+                while (
+                    len(self._async_queue) >= self._max_async_queue
+                    and not self._stop_requested.is_set()
+                ):
+                    self._async_queue_condition.wait(timeout=0.05)
+
+                if self._stop_requested.is_set():
+                    return
+
+                self._async_queue.append(segment)
+                self._async_queue_condition.notify_all()
 
     def wait_until_done(self):
         """Block until the current asynchronous speech thread completes."""
@@ -774,8 +885,9 @@ class TextToSpeech:
         """Stop any active speech output across both supported backends."""
         self._stop_requested.set()
 
-        with self._async_queue_lock:
+        with self._async_queue_condition:
             self._async_queue.clear()
+            self._async_queue_condition.notify_all()
 
         with self._lock:
             engine = self._active_engine

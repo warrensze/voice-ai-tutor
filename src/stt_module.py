@@ -16,6 +16,32 @@ MAX_DYNAMIC_THRESHOLD = 0.015
 CALIBRATION_CHUNKS = 8
 MIN_SPEECH_CHUNKS = 6
 SPEAKER_ECHO_THRESHOLD = 0.12  # Very aggressive echo filtering - speaker output is typically 3-5x louder than user speech
+ENABLE_ECHO_CANCELLATION = os.getenv("STT_ENABLE_ECHO_CANCELLATION", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+ENABLE_NOISE_REDUCTION = os.getenv("STT_ENABLE_NOISE_REDUCTION", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+ENABLE_AUTO_GAIN = os.getenv("STT_ENABLE_AUTO_GAIN", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+NOISE_REDUCTION_STRENGTH = float(os.getenv("STT_NOISE_REDUCTION_STRENGTH", "0.7"))
+NOISE_GATE_MULTIPLIER = float(os.getenv("STT_NOISE_GATE_MULTIPLIER", "1.6"))
+TARGET_INPUT_RMS = float(os.getenv("STT_TARGET_INPUT_RMS", "0.08"))
+MAX_AUTO_GAIN = float(os.getenv("STT_MAX_AUTO_GAIN", "6.0"))
+ECHO_GUARD_SECONDS = float(os.getenv("STT_ECHO_GUARD_SECONDS", "0.8"))
+ECHO_START_SUPPRESS_SECONDS = float(
+    os.getenv("STT_ECHO_START_SUPPRESS_SECONDS", "0.35")
+)
+ECHO_START_SUPPRESS_MIN_GAIN = float(
+    os.getenv("STT_ECHO_START_SUPPRESS_MIN_GAIN", "0.35")
+)
 DEBUG_AUDIO = os.getenv("DEBUG_AUDIO", "").lower() in {
     "1",
     "true",
@@ -41,6 +67,151 @@ class SpeechToText:
         self.rate = 16000
         self.input_device = self._resolve_input_device()
         self._last_threshold = ENERGY_THRESHOLD
+        self.enable_echo_cancellation = ENABLE_ECHO_CANCELLATION
+        self.enable_noise_reduction = ENABLE_NOISE_REDUCTION
+        self.enable_auto_gain = ENABLE_AUTO_GAIN
+
+    def _is_tts_recently_active(self) -> bool:
+        """Return True if speaker playback is active or just recently ended."""
+        if not self.tts_instance:
+            return False
+
+        try:
+            if self.tts_instance.is_audio_playing():
+                return True
+        except Exception:
+            return False
+
+        recently_played = getattr(self.tts_instance, "recently_played", None)
+        if callable(recently_played):
+            try:
+                return bool(recently_played(ECHO_GUARD_SECONDS))
+            except Exception:
+                return False
+
+        return False
+
+    def _build_noise_reference(self, audio_buffer: list[np.ndarray]) -> np.ndarray:
+        """Build a noise reference from initial calibration chunks."""
+        if not audio_buffer:
+            return np.array([], dtype=np.float32)
+
+        frames = audio_buffer[:CALIBRATION_CHUNKS]
+        if not frames:
+            return np.array([], dtype=np.float32)
+
+        return np.concatenate([frame.flatten() for frame in frames]).astype(np.float32)
+
+    def _pre_emphasis(self, audio: np.ndarray, coeff: float = 0.97) -> np.ndarray:
+        """Apply a light high-pass filter to reduce low-frequency rumble."""
+        if audio.size == 0:
+            return audio
+
+        emphasized = np.empty_like(audio, dtype=np.float32)
+        emphasized[0] = audio[0]
+        emphasized[1:] = audio[1:] - (coeff * audio[:-1])
+        return emphasized
+
+    def _noise_gate(self, audio: np.ndarray, noise_reference: np.ndarray) -> np.ndarray:
+        """Attenuate samples that are likely below useful speech level."""
+        if audio.size == 0 or noise_reference.size == 0:
+            return audio
+
+        noise_rms = float(np.sqrt(np.mean(noise_reference * noise_reference)))
+        if noise_rms <= 0:
+            return audio
+
+        gate_threshold = noise_rms * NOISE_GATE_MULTIPLIER
+        gated = audio.copy()
+        gated[np.abs(gated) < gate_threshold] *= 0.15
+        return gated.astype(np.float32)
+
+    def _spectral_noise_reduction(
+        self, audio: np.ndarray, noise_reference: np.ndarray
+    ) -> np.ndarray:
+        """Apply spectral subtraction to reduce steady background noise."""
+        if audio.size == 0 or noise_reference.size == 0:
+            return audio
+
+        n_fft = int(2 ** np.ceil(np.log2(max(audio.size, 512))))
+        signal_spec = np.fft.rfft(audio, n=n_fft)
+        noise_spec = np.fft.rfft(noise_reference, n=n_fft)
+
+        signal_mag = np.abs(signal_spec)
+        noise_mag = np.abs(noise_spec)
+        floor = signal_mag * 0.08
+        reduced_mag = np.maximum(
+            signal_mag - (NOISE_REDUCTION_STRENGTH * noise_mag),
+            floor,
+        )
+
+        reduced_spec = reduced_mag * np.exp(1j * np.angle(signal_spec))
+        denoised = np.fft.irfft(reduced_spec, n=n_fft)[: audio.size]
+        return denoised.astype(np.float32)
+
+    def _auto_gain(self, audio: np.ndarray) -> np.ndarray:
+        """Normalize voice level into a target RMS range for Whisper."""
+        if audio.size == 0:
+            return audio
+
+        rms = float(np.sqrt(np.mean(audio * audio)))
+        if rms <= 1e-7:
+            return audio
+
+        gain = min(TARGET_INPUT_RMS / rms, MAX_AUTO_GAIN)
+        adjusted = np.clip(audio * gain, -1.0, 1.0)
+        return adjusted.astype(np.float32)
+
+    def _suppress_echo_start(self, audio: np.ndarray) -> np.ndarray:
+        """Suppress early capture where speaker bleed is strongest."""
+        if audio.size == 0:
+            return audio
+
+        suppress_samples = int(self.rate * ECHO_START_SUPPRESS_SECONDS)
+        suppress_samples = min(max(0, suppress_samples), audio.size)
+        if suppress_samples <= 0:
+            return audio
+
+        faded = audio.copy()
+        fade_curve = np.linspace(
+            ECHO_START_SUPPRESS_MIN_GAIN,
+            1.0,
+            suppress_samples,
+            dtype=np.float32,
+        )
+        faded[:suppress_samples] *= fade_curve
+        return faded.astype(np.float32)
+
+    def _post_process_audio(
+        self,
+        audio: np.ndarray,
+        noise_reference: np.ndarray,
+        had_speaker_activity: bool,
+    ) -> np.ndarray:
+        """Run echo/noise/volume processing on captured audio before Whisper."""
+        if audio.size == 0:
+            return audio
+
+        processed = audio.astype(np.float32)
+
+        # Remove DC offset for cleaner downstream processing.
+        processed = processed - np.mean(processed)
+
+        if self.enable_noise_reduction:
+            processed = self._noise_gate(processed, noise_reference)
+            processed = self._spectral_noise_reduction(processed, noise_reference)
+
+        if self.enable_echo_cancellation and (
+            had_speaker_activity or self._is_tts_recently_active()
+        ):
+            processed = self._suppress_echo_start(processed)
+
+        processed = self._pre_emphasis(processed)
+
+        if self.enable_auto_gain:
+            processed = self._auto_gain(processed)
+
+        return np.clip(processed, -1.0, 1.0).astype(np.float32)
 
     def _resolve_input_device(self):
         """Resolve input device from env override or system default."""
@@ -149,7 +320,7 @@ class SpeechToText:
             max_idle_seconds if max_idle_seconds is not None else MAX_IDLE_SECONDS
         )
 
-        def capture_once(samplerate: int) -> np.ndarray:
+        def capture_once(samplerate: int) -> tuple[np.ndarray, np.ndarray, bool]:
             """Capture a single utterance at the requested sample rate."""
             nonlocal active_threshold
             audio_buffer: list[np.ndarray] = []
@@ -157,6 +328,7 @@ class SpeechToText:
             idle_chunks = 0
             speaking = False
             speech_chunks = 0
+            had_speaker_activity = False
             max_idle_chunks = int((samplerate / self.chunk_size) * idle_window_seconds)
 
             # If TTS is playing, use a much higher threshold to filter out speaker echo
@@ -181,7 +353,11 @@ class SpeechToText:
             ):
                 while True:
                     if stop_event is not None and stop_event.is_set():
-                        return np.array([], dtype=np.float32)
+                        return (
+                            np.array([], dtype=np.float32),
+                            np.array([], dtype=np.float32),
+                            had_speaker_activity,
+                        )
 
                     if audio_buffer:
                         if len(audio_buffer) == CALIBRATION_CHUNKS:
@@ -197,8 +373,10 @@ class SpeechToText:
 
                         # When TTS is playing, filter out speaker echo but allow loud user speech
                         current_tts_state = (
-                            self.tts_instance and self.tts_instance.is_audio_playing()
+                            self.tts_instance and self._is_tts_recently_active()
                         )
+                        if current_tts_state:
+                            had_speaker_activity = True
                         if current_tts_state and speech_prob > echo_filter_threshold:
                             # This is likely echo, not user speech (speaker output is much louder)
                             # Skip this chunk to prevent false trigger on speaker audio
@@ -243,21 +421,38 @@ class SpeechToText:
                         if speaking and silent_chunks > silence_chunks_to_stop:
                             break
                         if not speaking and idle_chunks > max_idle_chunks:
-                            return np.array([], dtype=np.float32)
+                            return (
+                                np.array([], dtype=np.float32),
+                                np.array([], dtype=np.float32),
+                                had_speaker_activity,
+                            )
 
                     sd.sleep(50)  # Small delay to prevent busy waiting
 
             if not audio_buffer:
-                return np.array([], dtype=np.float32)
+                return (
+                    np.array([], dtype=np.float32),
+                    np.array([], dtype=np.float32),
+                    had_speaker_activity,
+                )
 
             if speech_chunks < MIN_SPEECH_CHUNKS:
-                return np.array([], dtype=np.float32)
-
-            return np.concatenate([chunk.flatten() for chunk in audio_buffer])
+                return (
+                    np.array([], dtype=np.float32),
+                    np.array([], dtype=np.float32),
+                    had_speaker_activity,
+                )
+            captured = np.concatenate([chunk.flatten() for chunk in audio_buffer])
+            noise_reference = self._build_noise_reference(audio_buffer)
+            return captured, noise_reference, had_speaker_activity
 
         capture_rate = self.rate
+        noise_reference = np.array([], dtype=np.float32)
+        had_speaker_activity = False
         try:
-            full_audio = capture_once(capture_rate)
+            full_audio, noise_reference, had_speaker_activity = capture_once(
+                capture_rate
+            )
         except Exception as first_error:
             fallback_rate = self._get_device_default_samplerate()
             if fallback_rate and fallback_rate != capture_rate:
@@ -268,7 +463,11 @@ class SpeechToText:
                     )
                 try:
                     capture_rate = fallback_rate
-                    full_audio = capture_once(capture_rate)
+                    (
+                        full_audio,
+                        noise_reference,
+                        had_speaker_activity,
+                    ) = capture_once(capture_rate)
                 except Exception as second_error:
                     if announce:
                         print(
@@ -292,6 +491,16 @@ class SpeechToText:
 
         if capture_rate != self.rate:
             full_audio = self._resample_audio(full_audio, capture_rate, self.rate)
+            if noise_reference.size:
+                noise_reference = self._resample_audio(
+                    noise_reference, capture_rate, self.rate
+                )
+
+        full_audio = self._post_process_audio(
+            full_audio,
+            noise_reference=noise_reference,
+            had_speaker_activity=had_speaker_activity,
+        )
 
         if announce:
             capture_label = (

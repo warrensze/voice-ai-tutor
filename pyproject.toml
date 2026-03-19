@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice-ai-tutor"
-version = "0.1.1"
+version = "0.1.2"
 description = "A study tutor that you can talk to"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -44,6 +44,8 @@ voice-ai-tutor = "main:main"
 package-dir = {"" = "src"}
 py-modules = [
     "crash_logger",
+    "persistence",
+    "note_taker_agent",
     "main",
     "voice_agent",
     "router_agent",

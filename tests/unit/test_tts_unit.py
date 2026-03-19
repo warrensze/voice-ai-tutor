@@ -1,4 +1,6 @@
 import sys
+import os
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -48,28 +50,40 @@ class FakeEngine:
 
 
 class TestTextToSpeech(unittest.TestCase):
+    def _create_tts(self) -> TextToSpeech:
+        with (
+            patch.dict(os.environ, {"TTS_REQUIRE_KOKORO": "0"}, clear=False),
+            patch.multiple(
+                "tts_module",
+                KPipeline=None,
+                sd=None,
+                WaveGlowConfig=None,
+                WaveGlowSynthesizer=None,
+            ),
+        ):
+            return TextToSpeech()
+
     def test_default_voice_is_af_heart(self):
-        with patch("tts_module.KPipeline", None), patch("tts_module.sd", None):
-            tts = TextToSpeech()
+        tts = self._create_tts()
         self.assertEqual(tts.voice, "af_heart")
 
     def test_set_voice_updates_voice_name(self):
-        with patch("tts_module.KPipeline", None), patch("tts_module.sd", None):
-            tts = TextToSpeech()
-            tts.set_voice("af_bella")
+        tts = self._create_tts()
+        tts.set_voice("af_bella")
         self.assertEqual(tts.voice, "af_bella")
 
     def test_speak_ignores_empty_text(self):
-        with patch("tts_module.KPipeline", None), patch("tts_module.sd", None):
-            tts = TextToSpeech()
+        tts = self._create_tts()
         with patch("tts_module.pyttsx3.init") as mock_init:
             tts.speak("")
         mock_init.assert_not_called()
 
     def test_speak_initializes_and_speaks(self):
         engine = FakeEngine()
-        with patch("tts_module.KPipeline", None), patch("tts_module.sd", None):
-            tts = TextToSpeech()
+        tts = self._create_tts()
+        tts.backend = "pyttsx3"
+        tts._kokoro_pipeline = None
+        tts._waveglow_synth = None
 
         with patch("tts_module.pyttsx3.init", return_value=engine) as mock_init:
             tts.speak("hello")
@@ -83,8 +97,10 @@ class TestTextToSpeech(unittest.TestCase):
     def test_speak_retries_once_after_failure(self):
         failing_engine = FakeEngine(fail_run=True)
         working_engine = FakeEngine()
-        with patch("tts_module.KPipeline", None), patch("tts_module.sd", None):
-            tts = TextToSpeech()
+        tts = self._create_tts()
+        tts.backend = "pyttsx3"
+        tts._kokoro_pipeline = None
+        tts._waveglow_synth = None
 
         with patch(
             "tts_module.pyttsx3.init", side_effect=[failing_engine, working_engine]
@@ -93,6 +109,46 @@ class TestTextToSpeech(unittest.TestCase):
 
         self.assertEqual(mock_init.call_count, 2)
         self.assertEqual(working_engine.spoken, ["retry this"])
+
+    def test_split_for_async_queue_preserves_all_text(self):
+        tts = self._create_tts()
+
+        tts._max_async_chars = 24
+        parts = tts._split_for_async_queue(
+            "This answer is long enough to require splitting into multiple spoken segments."
+        )
+
+        self.assertTrue(parts)
+        self.assertTrue(all(len(part) <= 24 for part in parts))
+        reconstructed = " ".join(parts)
+        self.assertIn("long enough", reconstructed)
+        self.assertIn("spoken segments", reconstructed)
+
+    def test_async_queue_backpressure_does_not_drop_segments(self):
+        tts = self._create_tts()
+
+        tts._max_async_queue = 1
+        tts._max_async_chars = 48
+        spoken: list[str] = []
+
+        def slow_speak(text: str):
+            spoken.append(text)
+            time.sleep(0.01)
+
+        tts._speak_chunks = slow_speak
+
+        chunks = [
+            "Segment one.",
+            "Segment two.",
+            "Segment three.",
+            "Segment four.",
+        ]
+
+        for chunk in chunks:
+            tts.speak_async(chunk)
+
+        tts.wait_until_done()
+        self.assertEqual(spoken, chunks)
 
 
 if __name__ == "__main__":

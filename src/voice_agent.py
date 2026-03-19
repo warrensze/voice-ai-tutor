@@ -36,17 +36,28 @@ from stt_module import SpeechToText
 from tts_module import TextToSpeech
 from vector import search_documents
 from voice_config import load_subject_voice_map
+from persistence import TutorPersistence
+from note_taker_agent import QuestionNoteTakerAgent
 
 MODEL_NAME = "llama3.1:8b"
 DEFAULT_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "220"))
 
 VOICE_STOP_WORDS = {"quit", "stop", "exit", "bye"}
-BARGE_IN_IDLE_SECONDS = 0.8
-BARGE_IN_MIN_CHARS = 3
+BARGE_IN_ENABLED = os.getenv("VOICE_BARGE_IN_ENABLED", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+BARGE_IN_IDLE_SECONDS = float(os.getenv("VOICE_BARGE_IN_IDLE_SECONDS", "0.8"))
+BARGE_IN_MIN_CHARS = int(os.getenv("VOICE_BARGE_IN_MIN_CHARS", "8"))
+BARGE_IN_MIN_WORDS = int(os.getenv("VOICE_BARGE_IN_MIN_WORDS", "2"))
 BARGE_JOIN_TIMEOUT_SECONDS = 1.2
 PLAYBACK_POLL_SECONDS = 0.05
 MEMORY_MAX_TURNS = 8
 MEMORY_MAX_CHARS_PER_MESSAGE = 500
+PERSISTED_MAX_MESSAGES_PER_SUBJECT = int(
+    os.getenv("PERSISTED_MAX_MESSAGES_PER_SUBJECT", "400")
+)
 SUPPORTED_SUBJECTS = ("history", "chemistry", "math", "english")
 
 
@@ -63,6 +74,13 @@ def keyboard_quit_requested() -> bool:
 
 def barge_in_passes_threshold(text: str) -> bool:
     """Apply interruption threshold rules for duplex barge-in transcripts."""
+    cleaned = text.strip().lower()
+    if cleaned in VOICE_STOP_WORDS:
+        return True
+
+    if len(cleaned.split()) < BARGE_IN_MIN_WORDS:
+        return False
+
     return _barge_in_passes_threshold(text, VOICE_STOP_WORDS, BARGE_IN_MIN_CHARS)
 
 
@@ -71,6 +89,11 @@ class VoiceAgent:
 
     def __init__(self):
         """Initialize speech components, memory buffer, and the chat model."""
+        self.persistence = TutorPersistence(
+            subjects=SUPPORTED_SUBJECTS,
+            max_messages_per_subject=PERSISTED_MAX_MESSAGES_PER_SUBJECT,
+        )
+        self.note_taker = QuestionNoteTakerAgent(self.persistence)
         self.mouth = TextToSpeech()
         self.ears = SpeechToText(
             tts_instance=self.mouth
@@ -93,6 +116,51 @@ class VoiceAgent:
         self.subject_voice_map = load_subject_voice_map()
         self.source_orchestrator = RunnableLambda(self._orchestrate_chain_inputs)
         self.current_subject = "english"  # Track the current subject for stickiness
+        self.barge_in_enabled = BARGE_IN_ENABLED
+        self._restore_persisted_state()
+
+    def _restore_persisted_state(self):
+        """Restore conversation history and active subject from disk."""
+        try:
+            conversation_by_subject, persisted_subject = (
+                self.persistence.load_conversation()
+            )
+        except Exception as error:
+            print(f"[Persistence] Failed to load conversation history: {error}")
+            return
+
+        restored_messages = 0
+        for subject in SUPPORTED_SUBJECTS:
+            memory = self.memories.get(subject)
+            if memory is None:
+                continue
+
+            records = conversation_by_subject.get(subject, [])
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+
+                role = str(record.get("role", "")).lower().strip()
+                content = str(record.get("content", "")).strip()
+                if not content:
+                    continue
+
+                if role == "human":
+                    memory.add_message(HumanMessage(content=content))
+                    restored_messages += 1
+                elif role == "ai":
+                    memory.add_message(AIMessage(content=content))
+                    restored_messages += 1
+
+        if persisted_subject in SUPPORTED_SUBJECTS:
+            self.current_subject = persisted_subject
+
+        if restored_messages > 0:
+            restored_turns = restored_messages // 2
+            print(
+                f"[Persistence] Restored {restored_turns} prior turn(s). "
+                f"Current subject: {self.current_subject}"
+            )
 
     def _set_subject_voice(self, subject: str):
         """Apply per-subject voice settings before speaking the response."""
@@ -143,6 +211,20 @@ class VoiceAgent:
         )
         memory.add_message(HumanMessage(content=user_text))
         memory.add_message(AIMessage(content=assistant_text))
+
+        try:
+            self.persistence.append_turn(subject, user_text, assistant_text)
+            changed = self.note_taker.persist_from_response(
+                subject,
+                assistant_output,
+                source_prompt=user_input,
+            )
+            if changed:
+                print(
+                    f"[Persistence] Stored {len(changed)} question(s) under {subject}."
+                )
+        except Exception as error:
+            print(f"[Persistence] Failed to persist turn/question data: {error}")
 
     def _memory_context(self, subject: str) -> str:
         """Return compact memory text from the selected specialist history."""
@@ -210,6 +292,10 @@ class VoiceAgent:
 
         # Update current subject for sticky persistence
         self.current_subject = subject
+        try:
+            self.persistence.set_current_subject(subject)
+        except Exception as error:
+            print(f"[Persistence] Failed to update current subject: {error}")
 
         chain_inputs = self.source_orchestrator.invoke(
             {"question": user_input, "subject": subject}
@@ -228,12 +314,14 @@ class VoiceAgent:
         sentence_buffer = ""
         interrupted = {"text": None}
         barge_stop = threading.Event()
-        barge_thread = threading.Thread(
-            target=self._listen_for_barge_in,
-            args=(barge_stop, interrupted),
-            daemon=True,
-        )
-        barge_thread.start()
+        barge_thread = None
+        if self.barge_in_enabled:
+            barge_thread = threading.Thread(
+                target=self._listen_for_barge_in,
+                args=(barge_stop, interrupted),
+                daemon=True,
+            )
+            barge_thread.start()
 
         try:
             for chunk in specialist_chain.stream(chain_inputs):
@@ -268,14 +356,15 @@ class VoiceAgent:
                     interrupted["text"] = "quit"
                     barge_stop.set()
                     break
-                if barge_stop.is_set():
+                if self.barge_in_enabled and barge_stop.is_set():
                     break
                 time.sleep(PLAYBACK_POLL_SECONDS)
         finally:
             barge_stop.set()
-            barge_thread.join(timeout=BARGE_JOIN_TIMEOUT_SECONDS)
+            if barge_thread is not None:
+                barge_thread.join(timeout=BARGE_JOIN_TIMEOUT_SECONDS)
 
-        if interrupted["text"]:
+        if self.barge_in_enabled and interrupted["text"]:
             self.mouth.stop(wait=False)
             interruption_text = interrupted["text"].strip()
             print(f"\n[Barge-in] {interruption_text}\n")
@@ -287,7 +376,11 @@ class VoiceAgent:
     def run(self):
         """Run the main conversational loop until the user exits."""
         print(f"--- Voice Tutor Agent Ready (Using {MODEL_NAME}) ---")
-        print("Voice conversation is active. Say 'quit'/'stop' or press 'q' to end.\n")
+        print("Voice conversation is active. Say 'quit'/'stop' or press 'q' to end.")
+        print(
+            f"[Barge-in] {'Enabled' if self.barge_in_enabled else 'Disabled'} "
+            f"(set VOICE_BARGE_IN_ENABLED=1 to enable).\n"
+        )
 
         pending_user_input = None
         empty_listen_count = 0
@@ -295,86 +388,95 @@ class VoiceAgent:
         voice_prompt_shown = False
         keyboard_prompt_shown = False
 
-        while True:
-            try:
-                if keyboard_quit_requested():
-                    self.mouth.speak("Goodbye! Keep studying!")
-                    print("Shutting down...")
-                    break
-
-                if pending_user_input:
-                    user_input = pending_user_input
-                    pending_user_input = None
-                    voice_prompt_shown = False
-                    keyboard_prompt_shown = False
-                else:
-                    if use_keyboard_fallback:
-                        # Fallback to keyboard input if audio keeps failing
-                        if not keyboard_prompt_shown:
-                            print("\n[Ready] Listening via keyboard input.")
-                            keyboard_prompt_shown = True
-                        user_input = input(
-                            "\n[Keyboard Input] Enter your question: "
-                        ).strip()
-                    else:
-                        if not voice_prompt_shown:
-                            print("\n[Ready] App is ready. [Listening] Speak now...")
-                            voice_prompt_shown = True
-                        user_input = self.ears.listen(announce=False)
-                        # Track empty returns to detect missing audio device
-                        if not user_input:
-                            empty_listen_count += 1
-                            if empty_listen_count > 5:
-                                print(
-                                    "\n[Warning] No audio input detected after 5 attempts."
-                                )
-                                print("[Switching to keyboard input mode]")
-                                use_keyboard_fallback = True
-                                voice_prompt_shown = False
-                                keyboard_prompt_shown = False
-                                continue
-                        else:
-                            empty_listen_count = 0
-                            voice_prompt_shown = False
-                            keyboard_prompt_shown = False
-
-                    if not user_input or len(user_input) < 2:
-                        continue
-
-                if user_input.strip().lower() in VOICE_STOP_WORDS:
-                    self.mouth.speak("Goodbye! Keep studying!")
-                    print("Shutting down...")
-                    break
-
-                print(f"\nUser: {user_input}")
-                print("[Processing] Thinking...")
-                full_response, interruption_text, active_subject = (
-                    self._stream_response_with_barge_in(user_input)
-                )
-
-                if interruption_text:
-                    if interruption_text.lower() in VOICE_STOP_WORDS:
+        try:
+            while True:
+                try:
+                    if keyboard_quit_requested():
                         self.mouth.speak("Goodbye! Keep studying!")
                         print("Shutting down...")
                         break
 
-                    pending_user_input = interruption_text
-                    continue
+                    if pending_user_input:
+                        user_input = pending_user_input
+                        pending_user_input = None
+                        voice_prompt_shown = False
+                        keyboard_prompt_shown = False
+                    else:
+                        if use_keyboard_fallback:
+                            # Fallback to keyboard input if audio keeps failing
+                            if not keyboard_prompt_shown:
+                                print("\n[Ready] Listening via keyboard input.")
+                                keyboard_prompt_shown = True
+                            user_input = input(
+                                "\n[Keyboard Input] Enter your question: "
+                            ).strip()
+                        else:
+                            if not voice_prompt_shown:
+                                print(
+                                    "\n[Ready] App is ready. [Listening] Speak now..."
+                                )
+                                voice_prompt_shown = True
+                            user_input = self.ears.listen(announce=False)
+                            # Track empty returns to detect missing audio device
+                            if not user_input:
+                                empty_listen_count += 1
+                                if empty_listen_count > 5:
+                                    print(
+                                        "\n[Warning] No audio input detected after 5 attempts."
+                                    )
+                                    print("[Switching to keyboard input mode]")
+                                    use_keyboard_fallback = True
+                                    voice_prompt_shown = False
+                                    keyboard_prompt_shown = False
+                                    continue
+                            else:
+                                empty_listen_count = 0
+                                voice_prompt_shown = False
+                                keyboard_prompt_shown = False
 
-                if full_response.strip():
-                    self._remember_turn(
-                        user_input,
-                        full_response.strip(),
-                        active_subject,
+                        if not user_input or len(user_input) < 2:
+                            continue
+
+                    if user_input.strip().lower() in VOICE_STOP_WORDS:
+                        self.mouth.speak("Goodbye! Keep studying!")
+                        print("Shutting down...")
+                        break
+
+                    print(f"\nUser: {user_input}")
+                    print("[Processing] Thinking...")
+                    full_response, interruption_text, active_subject = (
+                        self._stream_response_with_barge_in(user_input)
                     )
 
-            except KeyboardInterrupt:
-                print("\nShutting down...")
-                break
+                    if interruption_text:
+                        if interruption_text.lower() in VOICE_STOP_WORDS:
+                            self.mouth.speak("Goodbye! Keep studying!")
+                            print("Shutting down...")
+                            break
+
+                        pending_user_input = interruption_text
+                        continue
+
+                    if full_response.strip():
+                        self._remember_turn(
+                            user_input,
+                            full_response.strip(),
+                            active_subject,
+                        )
+
+                except KeyboardInterrupt:
+                    print("\nShutting down...")
+                    break
+                except Exception as error:
+                    print(f"Error: {error}")
+                    try:
+                        self.mouth.speak("I encountered an error. Please try again.")
+                    except Exception as tts_error:
+                        print(f"[Mouth] TTS error while reporting failure: {tts_error}")
+                    continue
+        finally:
+            # Ensure background playback is fully stopped before interpreter teardown.
+            try:
+                self.mouth.stop(wait=True)
             except Exception as error:
-                print(f"Error: {error}")
-                try:
-                    self.mouth.speak("I encountered an error. Please try again.")
-                except Exception as tts_error:
-                    print(f"[Mouth] TTS error while reporting failure: {tts_error}")
-                continue
+                print(f"[Mouth] Shutdown cleanup error: {error}")
