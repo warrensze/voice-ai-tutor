@@ -48,6 +48,7 @@ from settings_store import UserSettings, load_user_settings
 
 MODEL_NAME = "llama3.1:8b"
 DEFAULT_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "220"))
+UI_TURN_TIMEOUT_SECONDS = float(os.getenv("VOICE_TUTOR_TURN_TIMEOUT_SECONDS", "60"))
 
 VOICE_STOP_WORDS = {"quit", "stop", "exit", "bye"}
 BARGE_IN_ENABLED = os.getenv("VOICE_BARGE_IN_ENABLED", "0").lower() in {
@@ -125,7 +126,16 @@ class VoiceAgent:
         self.current_subject = self.settings.current_subject
         self.barge_in_enabled = BARGE_IN_ENABLED
         self._turn_lock = threading.Lock()
+        self._cancel_event = threading.Event()
         self._restore_persisted_state()
+
+    def cancel_current_turn(self):
+        """Request cancellation of the active turn and stop any current speech."""
+        self._cancel_event.set()
+        try:
+            self.mouth.stop(wait=False)
+        except Exception:
+            pass
 
     def _restore_persisted_state(self):
         """Restore conversation history and active subject from disk."""
@@ -422,9 +432,44 @@ class VoiceAgent:
         print("\n")
         return full_response, None, active_subject
 
-    def stream_ui_turn(self, user_input: str, *, speak: bool = True):
+    def stream_ui_turn(
+        self,
+        user_input: str,
+        *,
+        speak: bool = True,
+        stop_event: threading.Event | None = None,
+        timeout_seconds: float | None = None,
+    ):
         """Yield structured events for the browser UI while streaming a turn."""
         with self._turn_lock:
+            self._cancel_event.clear()
+            started_at = time.monotonic()
+            timeout = (
+                UI_TURN_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+            )
+
+            def stop_requested() -> bool:
+                return self._cancel_event.is_set() or (
+                    stop_event is not None and stop_event.is_set()
+                )
+
+            def timed_out() -> bool:
+                return timeout > 0 and (time.monotonic() - started_at) >= timeout
+
+            def stop_message(reason: str) -> dict[str, str]:
+                if reason == "timeout":
+                    message = (
+                        f"I stopped because this response took longer than "
+                        f"{int(timeout)} seconds."
+                    )
+                else:
+                    message = "Stopped."
+                return {
+                    "type": "stopped",
+                    "reason": reason,
+                    "message": message,
+                }
+
             if speak:
                 stop_all_tts(except_instance=self.mouth, wait=False)
                 self.mouth.stop(wait=False, release_owner=False)
@@ -458,11 +503,26 @@ class VoiceAgent:
                 "sources": chain_inputs.get("source_cards", []),
             }
 
+            if stop_requested():
+                self.mouth.stop(wait=False)
+                yield stop_message("cancelled")
+                return
+
             full_response = ""
             sentence_buffer = ""
             stream_speech = self.mouth.backend != "pyttsx3"
             try:
                 for chunk in specialist_chain.stream(chain_inputs):
+                    if stop_requested():
+                        self.mouth.stop(wait=False)
+                        yield stop_message("cancelled")
+                        return
+                    if timed_out():
+                        self._cancel_event.set()
+                        self.mouth.stop(wait=False)
+                        yield stop_message("timeout")
+                        return
+
                     content = chunk or ""
                     if not content:
                         continue
@@ -484,9 +544,31 @@ class VoiceAgent:
                     self.mouth.speak_async(full_response.strip())
 
                 while speak and self.mouth.has_pending_audio():
+                    if stop_requested():
+                        self.mouth.stop(wait=False)
+                        yield stop_message("cancelled")
+                        return
+                    if timed_out():
+                        self._cancel_event.set()
+                        self.mouth.stop(wait=False)
+                        yield stop_message("timeout")
+                        return
                     time.sleep(PLAYBACK_POLL_SECONDS)
             except Exception as error:
+                if stop_requested():
+                    yield stop_message("cancelled")
+                    return
                 yield {"type": "error", "message": str(error)}
+                return
+
+            if stop_requested():
+                self.mouth.stop(wait=False)
+                yield stop_message("cancelled")
+                return
+            if timed_out():
+                self._cancel_event.set()
+                self.mouth.stop(wait=False)
+                yield stop_message("timeout")
                 return
 
             if full_response.strip():

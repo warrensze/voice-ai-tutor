@@ -43,6 +43,14 @@ Last updated: 2026-06-08
   new spoken turns stop current audio first.
 - Browser spoken turns now stay in the speaking state until the backend TTS
   queue drains, and the UI blocks a second active chat turn while one is running.
+- Stop/interrupt path: `/api/voice/stop` now cancels active turn events, stops
+  TTS, resets the runtime signature, and returns independently from the chat
+  WebSocket. WebSocket generation runs in a worker thread so the FastAPI event
+  loop can still handle Stop/status requests while the model is thinking.
+- Time limits:
+  - UI turn timeout: `VOICE_TUTOR_TURN_TIMEOUT_SECONDS`, default `60` seconds.
+  - llama.cpp chat socket timeout: `VOICE_TUTOR_LLM_TIMEOUT_SECONDS`, default
+    `30` seconds.
 - If the selected backend falls back to pyttsx3, spoken web turns now speak the
   completed response as one pyttsx3 engine run instead of feeding pyttsx3
   sentence-by-sentence.

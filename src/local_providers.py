@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -13,6 +14,10 @@ from langchain_core.runnables import Runnable
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
 from settings_store import UserSettings
+
+LLAMACPP_CHAT_TIMEOUT_SECONDS = float(
+    os.getenv("VOICE_TUTOR_LLM_TIMEOUT_SECONDS", "30")
+)
 
 
 def _join_url(base_url: str, path: str) -> str:
@@ -228,6 +233,7 @@ def create_chat_model(settings: UserSettings, *, num_predict: int = 220):
         api_key=settings.llamacpp_api_key,
         temperature=0.7,
         max_tokens=num_predict,
+        timeout=LLAMACPP_CHAT_TIMEOUT_SECONDS,
     )
 
 

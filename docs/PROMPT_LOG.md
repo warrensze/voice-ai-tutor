@@ -23,3 +23,7 @@
   selection. Restarted the local web service, added voice discovery/selection,
   changed pyttsx3 fallback to full-response speech, and cleaned websocket
   disconnect speech shutdown.
+- Reported the tutor stuck thinking and Stop not working; added interrupt
+  cancellation, moved chat generation off the FastAPI event loop, added
+  `/api/voice/stop` cancellation of active turn events, and added response
+  timeouts.

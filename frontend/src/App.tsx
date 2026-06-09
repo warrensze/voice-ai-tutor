@@ -366,6 +366,18 @@ export default function App() {
         );
         socket.close();
       }
+      if (payload.type === "stopped") {
+        turnActiveRef.current = false;
+        setAppState("idle");
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === assistantId && !message.content
+              ? { ...message, content: payload.message || "Stopped." }
+              : message
+          )
+        );
+        socket.close();
+      }
     };
     socket.onerror = () => {
       turnActiveRef.current = false;
@@ -420,10 +432,19 @@ export default function App() {
 
   async function stopEverything() {
     turnActiveRef.current = false;
-    wsRef.current?.send(JSON.stringify({ type: "stop" }));
+    setAppState("idle");
+    try {
+      await api("/api/voice/stop", { method: "POST", body: JSON.stringify({}) });
+    } catch {
+      // The local backend may already be busy stopping; the UI should still reset.
+    }
+    try {
+      wsRef.current?.send(JSON.stringify({ type: "stop" }));
+    } catch {
+      // Ignore a socket that has already closed.
+    }
     wsRef.current?.close();
     recorderRef.current?.stop();
-    await api("/api/voice/stop", { method: "POST", body: JSON.stringify({}) });
     setAppState("idle");
   }
 

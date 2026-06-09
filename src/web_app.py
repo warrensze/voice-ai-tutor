@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -42,6 +45,10 @@ from tts_module import list_tts_voices, stop_all_tts
 from vector import get_ingestion_summary
 from voice_agent import VoiceAgent
 
+UI_TURN_TIMEOUT_SECONDS = float(
+    os.getenv("VOICE_TUTOR_TURN_TIMEOUT_SECONDS", "60")
+)
+
 app = FastAPI(title="Voice AI Tutor", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
@@ -57,6 +64,8 @@ _runtime: VoiceAgent | None = None
 _runtime_signature = ""
 _stt_lock = threading.Lock()
 _stt: SpeechToText | None = None
+_turn_events_lock = threading.Lock()
+_active_turn_events: set[threading.Event] = set()
 
 
 def _runtime_for_settings() -> VoiceAgent:
@@ -83,6 +92,132 @@ def _stt_instance() -> SpeechToText:
             runtime = _runtime_for_settings()
             _stt = SpeechToText(tts_instance=runtime.mouth)
         return _stt
+
+
+def _register_turn_event(event: threading.Event):
+    with _turn_events_lock:
+        _active_turn_events.add(event)
+
+
+def _unregister_turn_event(event: threading.Event):
+    with _turn_events_lock:
+        _active_turn_events.discard(event)
+
+
+def _request_turn_stop():
+    global _runtime_signature
+    with _turn_events_lock:
+        events = list(_active_turn_events)
+    for event in events:
+        event.set()
+    with _runtime_lock:
+        runtime = _runtime
+    if runtime is not None:
+        try:
+            runtime.cancel_current_turn()
+        except Exception:
+            pass
+        try:
+            runtime.mouth.stop(wait=False)
+        except Exception:
+            pass
+    stop_all_tts(wait=False)
+    _runtime_signature = ""
+
+
+async def _send_turn_from_worker(
+    websocket: WebSocket,
+    runtime: VoiceAgent,
+    question: str,
+    *,
+    speak: bool,
+    stop_event: threading.Event,
+):
+    loop = asyncio.get_running_loop()
+    event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    started_at = time.monotonic()
+
+    def push_event(event: dict[str, Any] | None):
+        try:
+            loop.call_soon_threadsafe(event_queue.put_nowait, event)
+        except RuntimeError:
+            pass
+
+    def worker():
+        try:
+            for event in runtime.stream_ui_turn(
+                question,
+                speak=speak,
+                stop_event=stop_event,
+                timeout_seconds=UI_TURN_TIMEOUT_SECONDS,
+            ):
+                push_event(event)
+                if event.get("type") in {"done", "error", "stopped"}:
+                    break
+                if stop_event.is_set():
+                    break
+        except Exception as error:
+            push_event({"type": "error", "message": str(error)})
+        finally:
+            push_event(None)
+
+    thread = threading.Thread(
+        target=worker,
+        daemon=True,
+        name="TutorTurnWorker",
+    )
+    thread.start()
+
+    terminal_sent = False
+    while True:
+        if stop_event.is_set():
+            await websocket.send_json(
+                {
+                    "type": "stopped",
+                    "reason": "cancelled",
+                    "message": "Stopped.",
+                }
+            )
+            terminal_sent = True
+            break
+
+        if (
+            UI_TURN_TIMEOUT_SECONDS > 0
+            and (time.monotonic() - started_at) >= UI_TURN_TIMEOUT_SECONDS
+        ):
+            stop_event.set()
+            _request_turn_stop()
+            await websocket.send_json(
+                {
+                    "type": "stopped",
+                    "reason": "timeout",
+                    "message": (
+                        "I stopped because this response took longer than "
+                        f"{int(UI_TURN_TIMEOUT_SECONDS)} seconds."
+                    ),
+                }
+            )
+            terminal_sent = True
+            break
+
+        try:
+            event = await asyncio.wait_for(event_queue.get(), timeout=0.25)
+        except asyncio.TimeoutError:
+            continue
+
+        if event is None:
+            break
+
+        if stop_event.is_set():
+            continue
+
+        await websocket.send_json(event)
+        if event.get("type") in {"done", "error", "stopped"}:
+            terminal_sent = True
+            break
+
+    if terminal_sent:
+        stop_event.set()
 
 
 def _check_url(url: str, *, timeout: float = 1.2) -> dict[str, Any]:
@@ -141,11 +276,15 @@ def get_voices():
 
 @app.put("/api/settings")
 async def put_settings(payload: dict[str, Any]):
+    _request_turn_stop()
     old_settings = load_user_settings()
     settings = update_user_settings(payload)
     save_user_settings(settings)
     global _runtime_signature, _stt
-    if old_settings.tts_backend != settings.tts_backend or old_settings.provider_signature() != settings.provider_signature():
+    if (
+        old_settings.tts_backend != settings.tts_backend
+        or old_settings.provider_signature() != settings.provider_signature()
+    ):
         stop_all_tts(wait=False)
         _stt = None
     _runtime_signature = ""
@@ -244,6 +383,7 @@ def preview_asset(asset_id: str):
 
 @app.post("/api/voice/test")
 async def test_voice(payload: dict[str, Any]):
+    _request_turn_stop()
     runtime = _runtime_for_settings()
     text = str(payload.get("text") or "This is the local tutor voice.")
     runtime.mouth.stop(wait=False, release_owner=False)
@@ -254,11 +394,7 @@ async def test_voice(payload: dict[str, Any]):
 
 @app.post("/api/voice/stop")
 def stop_voice():
-    try:
-        runtime = _runtime_for_settings()
-        runtime.mouth.stop(wait=False)
-    finally:
-        stop_all_tts(wait=False)
+    _request_turn_stop()
     return {"ok": True}
 
 
@@ -290,8 +426,7 @@ async def chat_websocket(websocket: WebSocket):
                 continue
 
             if payload.get("type") == "stop":
-                _runtime_for_settings().mouth.stop(wait=False)
-                stop_all_tts(wait=False)
+                _request_turn_stop()
                 await websocket.send_json({"type": "stopped"})
                 continue
 
@@ -304,11 +439,21 @@ async def chat_websocket(websocket: WebSocket):
 
             runtime = _runtime_for_settings()
             speak = bool(payload.get("speak", load_user_settings().speak_responses))
+            stop_event = threading.Event()
+            _register_turn_event(stop_event)
             await websocket.send_json({"type": "status", "status": "thinking"})
-            for event in runtime.stream_ui_turn(question, speak=speak):
-                await websocket.send_json(event)
+            try:
+                await _send_turn_from_worker(
+                    websocket,
+                    runtime,
+                    question,
+                    speak=speak,
+                    stop_event=stop_event,
+                )
+            finally:
+                _unregister_turn_event(stop_event)
     except WebSocketDisconnect:
-        stop_all_tts(wait=False)
+        _request_turn_stop()
 
 
 dist_dir = PROJECT_ROOT / "frontend" / "dist"
