@@ -1,6 +1,9 @@
 import re
 import threading
 import os
+import platform
+import shutil
+import subprocess
 import time
 import weakref
 from pathlib import Path
@@ -107,6 +110,10 @@ _TTS_INSTANCES = weakref.WeakSet()
 _ACTIVE_TTS_REF = None
 
 
+class TTSBackendUnavailable(RuntimeError):
+    """Raised when the selected TTS backend is not ready to speak."""
+
+
 def stop_all_tts(*, except_instance=None, wait: bool = False):
     """Stop every TTS instance except the optional current owner."""
     global _ACTIVE_TTS_REF
@@ -137,6 +144,116 @@ def _piper_data_dir_for(settings=None) -> Path:
     if not data_dir.is_absolute():
         data_dir = Path(__file__).resolve().parents[1] / data_dir
     return data_dir
+
+
+def _resolve_piper_voice_path(voice: str, settings=None) -> Path | None:
+    """Find a Piper ONNX voice by explicit path or configured voice id."""
+    if not voice:
+        return None
+
+    candidate = Path(voice).expanduser()
+    if candidate.suffix.lower() == ".onnx" and candidate.exists():
+        return candidate
+
+    data_dir = _piper_data_dir_for(settings)
+    candidates = [
+        data_dir / f"{voice}.onnx",
+        data_dir / voice / f"{voice}.onnx",
+        data_dir / voice,
+    ]
+    for path in candidates:
+        if path.suffix.lower() == ".onnx" and path.exists():
+            return path
+    return None
+
+
+def tts_backend_status(settings=None) -> dict[str, Any]:
+    """Return strict health for the selected local TTS backend."""
+    backend = str(getattr(settings, "tts_backend", "pyttsx3") or "pyttsx3").strip().lower()
+    voice = ""
+    if settings is not None and hasattr(settings, "selected_voice"):
+        voice = str(settings.selected_voice(getattr(settings, "current_subject", None)) or "")
+    else:
+        voice = str(getattr(settings, f"{backend}_voice", "") or "")
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "backend": backend,
+        "voice": voice,
+        "strict": True,
+        "error": "",
+    }
+
+    if backend == "piper":
+        if sd is None:
+            result["error"] = "Piper is selected, but sounddevice is not available."
+        elif PiperVoice is None:
+            result["error"] = f"Piper is selected, but the Piper package failed to import: {PIPER_IMPORT_ERROR!r}"
+        elif _resolve_piper_voice_path(voice, settings) is None:
+            result["error"] = f"Piper is selected, but voice '{voice}' was not found in {_piper_data_dir_for(settings)}."
+        else:
+            result["ok"] = True
+        return result
+
+    if backend == "kokoro":
+        if sd is None:
+            result["error"] = "Kokoro is selected, but sounddevice is not available."
+            return result
+        if KPipeline is None:
+            result["error"] = f"Kokoro is selected, but the Kokoro package failed to import: {KOKORO_IMPORT_ERROR!r}"
+            return result
+        try:
+            import torch
+        except Exception as error:
+            result["error"] = f"Kokoro is selected, but PyTorch failed to import: {error}"
+            return result
+
+        requested_device = os.getenv("KOKORO_DEVICE", "cuda").strip().lower() or "cuda"
+        allow_cpu = os.getenv("KOKORO_ALLOW_CPU", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            result["error"] = (
+                "Kokoro is selected, but CUDA is unavailable. "
+                "Set KOKORO_ALLOW_CPU=1 if you intentionally want CPU Kokoro."
+            )
+            return result
+        if requested_device == "cpu" and not allow_cpu:
+            result["error"] = "Kokoro is selected for CPU, but KOKORO_ALLOW_CPU is not enabled."
+            return result
+        result["ok"] = True
+        return result
+
+    if backend == "pyttsx3":
+        use_macos_say = os.getenv("TTS_USE_MACOS_SAY", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if platform.system() == "Darwin" and use_macos_say:
+            if shutil.which("say"):
+                result["ok"] = True
+            else:
+                result["error"] = "pyttsx3 is selected, but the macOS say command was not found."
+            return result
+        engine = None
+        try:
+            engine = pyttsx3.init()
+            result["ok"] = True
+        except Exception as error:
+            result["error"] = f"pyttsx3 is selected, but initialization failed: {error}"
+        finally:
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+        return result
+
+    result["error"] = f"Unsupported TTS backend selected: {backend}"
+    return result
 
 
 def list_piper_voices(settings=None) -> list[dict[str, Any]]:
@@ -254,7 +371,7 @@ class TextToSpeech:
         backend_order: str | list[str] | None = None,
         settings: "UserSettings | None" = None,
     ):
-        """Initialize voice settings and select the best available TTS backend."""
+        """Initialize the selected local TTS backend without provider fallback."""
         self.rate = 175
         configured_volume = float(os.getenv("TTS_OUTPUT_VOLUME", "1.0"))
         self.volume = min(1.0, max(0.0, configured_volume))
@@ -270,6 +387,7 @@ class TextToSpeech:
         self._piper_lock = threading.Lock()
         self._speak_async_lock = threading.Lock()
         self._active_engine = None
+        self._active_process = None
         self._stop_requested = threading.Event()
         self._speak_thread = None
         self._async_queue: list[str] = []
@@ -324,6 +442,13 @@ class TextToSpeech:
         self._piper_volume = float(
             getattr(settings, "piper_volume", os.getenv("PIPER_VOLUME", "1.0"))
         )
+        self._use_macos_say = os.getenv(
+            "TTS_USE_MACOS_SAY", "1"
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         self._kokoro_marker_path = (
             Path(__file__).resolve().parents[1]
             / f".kokoro_assets_{self._kokoro_repo_id.replace('/', '_')}.ready"
@@ -332,44 +457,38 @@ class TextToSpeech:
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         self.output_device_override = self._resolve_output_override()
-        self.require_kokoro = os.getenv("TTS_REQUIRE_KOKORO", "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        default_order = "kokoro,piper,waveglow,pyttsx3"
-        configured_order = backend_order or os.getenv("TTS_BACKEND_ORDER", default_order)
-        if isinstance(configured_order, str):
-            requested_order = [
-                name.strip().lower()
-                for name in configured_order.split(",")
-                if name.strip()
-            ]
-        else:
-            requested_order = [
-                str(name).strip().lower() for name in configured_order if str(name).strip()
-            ]
-        if backend:
-            selected_backend = str(backend).strip().lower()
-            requested_order = [selected_backend] + [
-                name for name in requested_order if name != selected_backend
-            ]
-        self.backend_order = list(dict.fromkeys(requested_order or ["pyttsx3"]))
-        self.backend = "pyttsx3"
-        print(
-            f"[Mouth] Initializing TTS backend (order: {', '.join(self.backend_order)})"
-        )
+        selected_backend = str(backend or os.getenv("TTS_BACKEND", "")).strip().lower()
+        if not selected_backend:
+            if isinstance(backend_order, str):
+                selected_backend = next(
+                    (
+                        name.strip().lower()
+                        for name in backend_order.split(",")
+                        if name.strip()
+                    ),
+                    "pyttsx3",
+                )
+            elif backend_order:
+                selected_backend = next(
+                    (
+                        str(name).strip().lower()
+                        for name in backend_order
+                        if str(name).strip()
+                    ),
+                    "pyttsx3",
+                )
+            else:
+                selected_backend = "pyttsx3"
+        self.backend_order = [selected_backend]
+        self.backend = selected_backend
+        self.backend_available = False
+        self.backend_error = ""
+        print(f"[Mouth] Initializing selected TTS backend: {self.backend}")
         self._configure_backend()
-        kokoro_was_primary = self.backend_order and self.backend_order[0] == "kokoro"
-        if self.backend != "kokoro" and kokoro_was_primary:
-            message = (
-                f"[Mouth] Kokoro was requested but backend resolved to '{self.backend}'. "
-                "Set TTS_REQUIRE_KOKORO=0 to allow fallback backends."
-            )
-            if self.require_kokoro:
-                raise RuntimeError(message)
-            print(message)
-        print(f"[Mouth] Using {self.backend.upper()} backend for speech output")
+        if self.backend_available:
+            print(f"[Mouth] Using {self.backend.upper()} backend for speech output")
+        else:
+            print(f"[Mouth] {self.backend.upper()} unavailable: {self.backend_error}")
         with _TTS_REGISTRY_LOCK:
             _TTS_INSTANCES.add(self)
         self._start_background_warmup()
@@ -444,7 +563,7 @@ class TextToSpeech:
         return None
 
     def _play_audio(self, audio: Any, sample_rate: int):
-        """Play audio on configured output device, then retry on system default if needed."""
+        """Play audio on the configured output device."""
         if sd is None:
             return
 
@@ -462,18 +581,9 @@ class TextToSpeech:
                 sd.stop()
                 sd.play(waveform, sample_rate, device=device)
                 sd.wait()
+            finally:
                 self._is_playing.clear()
                 self._last_playback_end = time.monotonic()
-                return
-            except Exception:
-                # Retry on system default in case selected output was unavailable.
-                try:
-                    sd.stop()
-                    sd.play(waveform, sample_rate)
-                    sd.wait()
-                finally:
-                    self._is_playing.clear()
-                    self._last_playback_end = time.monotonic()
 
     def _play_audio_exclusive(self, render_and_play):
         """Serialize non-sounddevice engines with the same process-wide speaker lock."""
@@ -487,42 +597,39 @@ class TextToSpeech:
                 pass
             render_and_play()
 
-    def _configure_backend(self):
-        """Select the first available backend from configured backend order."""
-        self.backend = "pyttsx3"
+    def _backend_unavailable(self, message: str) -> bool:
+        self.backend_available = False
+        self.backend_error = message
+        print(f"[Mouth] {message}")
+        return False
 
-        for candidate in self.backend_order:
-            if candidate == "waveglow":
-                if self._init_waveglow_backend():
-                    print("[Mouth] WaveGlow backend initialized successfully")
-                    self.backend = "waveglow"
-                    return
-                else:
-                    print(
-                        "[Mouth] WaveGlow backend initialization failed, trying next backend"
-                    )
-            elif candidate == "kokoro":
-                if self._init_kokoro_backend():
-                    print("[Mouth] Kokoro backend initialized successfully")
-                    self.backend = "kokoro"
-                    return
-                else:
-                    print(
-                        "[Mouth] Kokoro backend initialization failed, trying next backend"
-                    )
-            elif candidate == "piper":
-                if self._init_piper_backend():
-                    print("[Mouth] Piper backend initialized successfully")
-                    self.backend = "piper"
-                    return
-                else:
-                    print(
-                        "[Mouth] Piper backend initialization failed, trying next backend"
-                    )
-            elif candidate == "pyttsx3":
-                print("[Mouth] Falling back to pyttsx3 backend")
-                self.backend = "pyttsx3"
-                return
+    def _backend_ready(self) -> bool:
+        self.backend_available = True
+        self.backend_error = ""
+        return True
+
+    def _configure_backend(self):
+        """Initialize only the selected backend."""
+        initializers = {
+            "waveglow": self._init_waveglow_backend,
+            "kokoro": self._init_kokoro_backend,
+            "piper": self._init_piper_backend,
+            "pyttsx3": self._init_pyttsx3_backend,
+        }
+        initializer = initializers.get(self.backend)
+        if initializer is None:
+            self._backend_unavailable(f"Unsupported TTS backend selected: {self.backend}")
+            return
+
+        if initializer():
+            self._backend_ready()
+            print(f"[Mouth] {self.backend} backend initialized successfully")
+            return
+
+        if not self.backend_error:
+            self._backend_unavailable(
+                f"{self.backend} backend failed to initialize."
+            )
 
     def _init_kokoro_backend(self) -> bool:
         """Initialize Kokoro backend if dependencies are available.
@@ -533,24 +640,22 @@ class TextToSpeech:
         - Weighted blend: 'af_heart+af_bella@0.7' (70% af_heart, 30% af_bella)
         """
         if sd is None:
-            print("[Mouth] Kokoro dependency not available: sounddevice")
-            return False
+            return self._backend_unavailable(
+                "Kokoro is selected, but sounddevice is not available."
+            )
 
         if KPipeline is None:
-            print(
-                "[Mouth] Kokoro import failed. "
+            return self._backend_unavailable(
+                "Kokoro is selected, but the Kokoro package failed to import. "
                 f"Original error: {repr(KOKORO_IMPORT_ERROR)}"
             )
-            print(
-                "[Mouth] If you are on Python 3.14, use Python 3.12/3.13 for kokoro compatibility."
-            )
-            return False
 
         try:
             import torch
         except Exception as error:
-            print(f"[Mouth] PyTorch is required for kokoro. Import failed: {error}")
-            return False
+            return self._backend_unavailable(
+                f"Kokoro is selected, but PyTorch failed to import: {error}"
+            )
 
         requested_device = os.getenv("KOKORO_DEVICE", "cuda").strip().lower()
         if not requested_device:
@@ -564,21 +669,19 @@ class TextToSpeech:
 
         if requested_device.startswith("cuda") and not torch.cuda.is_available():
             if not allow_cpu:
-                print(
-                    "[Mouth] Kokoro requires CUDA but torch.cuda.is_available() is False. "
-                    "Set KOKORO_ALLOW_CPU=1 to permit CPU fallback."
+                return self._backend_unavailable(
+                    "Kokoro is selected, but CUDA is unavailable. "
+                    "Set KOKORO_ALLOW_CPU=1 if you intentionally want CPU Kokoro."
                 )
-                return False
             requested_device = "cpu"
             print(
-                "[Mouth] CUDA unavailable; using CPU for kokoro due KOKORO_ALLOW_CPU=1"
+                "[Mouth] CUDA unavailable; using CPU for Kokoro because KOKORO_ALLOW_CPU=1"
             )
 
         if requested_device == "cpu" and not allow_cpu:
-            print(
-                "[Mouth] KOKORO_DEVICE is set to CPU but KOKORO_ALLOW_CPU is not enabled."
+            return self._backend_unavailable(
+                "Kokoro is selected for CPU, but KOKORO_ALLOW_CPU is not enabled."
             )
-            return False
 
         try:
             self._kokoro_pipeline = KPipeline(
@@ -595,23 +698,22 @@ class TextToSpeech:
             self._preload_kokoro_assets()
             return True
         except Exception as e:
-            print(f"[Mouth] Failed to initialize Kokoro-82M: {e}")
             self._kokoro_pipeline = None
-            return False
+            return self._backend_unavailable(f"Failed to initialize Kokoro-82M: {e}")
 
     def _init_waveglow_backend(self) -> bool:
         """Prepare WaveGlow backend with lazy model loading."""
         if WaveGlowSynthesizer is None or WaveGlowConfig is None or sd is None:
-            print(
-                "[Mouth] WaveGlow dependencies not available (WaveGlowSynthesizer, WaveGlowConfig, or sounddevice)"
+            return self._backend_unavailable(
+                "WaveGlow is selected, but WaveGlowSynthesizer, WaveGlowConfig, or sounddevice is not available."
             )
-            return False
 
         try:
             import torch
         except Exception:
-            print("[Mouth] PyTorch not available, cannot use WaveGlow")
-            return False
+            return self._backend_unavailable(
+                "WaveGlow is selected, but PyTorch is not available."
+            )
 
         requested_device = os.getenv("WAVEGLOW_DEVICE", "cuda").strip().lower()
         if not requested_device:
@@ -628,17 +730,17 @@ class TextToSpeech:
 
         if requested_device.startswith("cuda") and not torch.cuda.is_available():
             if not allow_cpu:
-                print(
-                    "[Mouth] WaveGlow unavailable: CUDA is not available in torch. "
-                    "Set WAVEGLOW_ALLOW_CPU=1 to use CPU or install CUDA-enabled torch."
+                return self._backend_unavailable(
+                    "WaveGlow is selected, but CUDA is unavailable. "
+                    "Set WAVEGLOW_ALLOW_CPU=1 if you intentionally want CPU WaveGlow."
                 )
-                return False
             requested_device = "cpu"
-            print("[Mouth] CUDA not available, falling back to CPU for WaveGlow")
+            print("[Mouth] CUDA unavailable; using CPU for WaveGlow because WAVEGLOW_ALLOW_CPU=1")
 
         if requested_device == "cpu" and not allow_cpu:
-            print("[Mouth] CPU requested but WAVEGLOW_ALLOW_CPU not enabled")
-            return False
+            return self._backend_unavailable(
+                "WaveGlow is selected for CPU, but WAVEGLOW_ALLOW_CPU is not enabled."
+            )
 
         try:
             sigma = float(os.getenv("WAVEGLOW_SIGMA", "0.8"))
@@ -656,29 +758,29 @@ class TextToSpeech:
             self._waveglow_failed = False
             return True
         except Exception as e:
-            print(f"[Mouth] Failed to initialize WaveGlowSynthesizer: {e}")
             self._waveglow_synth = None
-            return False
+            return self._backend_unavailable(
+                f"Failed to initialize WaveGlowSynthesizer: {e}"
+            )
 
     def _init_piper_backend(self) -> bool:
         """Initialize Piper with a local ONNX voice file."""
         if sd is None:
-            print("[Mouth] Piper dependency not available: sounddevice")
-            return False
+            return self._backend_unavailable(
+                "Piper is selected, but sounddevice is not available."
+            )
         if PiperVoice is None:
-            print(
-                "[Mouth] Piper import failed. "
+            return self._backend_unavailable(
+                "Piper is selected, but the Piper package failed to import. "
                 f"Original error: {repr(PIPER_IMPORT_ERROR)}"
             )
-            return False
 
         voice_path = self._resolve_piper_voice_path(self.voice)
         if voice_path is None:
-            print(
-                f"[Mouth] Piper voice '{self.voice}' was not found in "
-                f"{self._piper_data_dir}."
+            return self._backend_unavailable(
+                f"Piper is selected, but voice '{self.voice}' was not found in "
+                f"{_piper_data_dir_for(self.settings)}."
             )
-            return False
 
         try:
             self._piper_voice = PiperVoice.load(
@@ -688,33 +790,19 @@ class TextToSpeech:
             self._piper_voice_path = voice_path
             return True
         except Exception as error:
-            print(f"[Mouth] Failed to load Piper voice {voice_path}: {error}")
             self._piper_voice = None
             self._piper_voice_path = None
-            return False
+            return self._backend_unavailable(
+                f"Failed to load Piper voice {voice_path}: {error}"
+            )
+
+    def _init_pyttsx3_backend(self) -> bool:
+        """Accept pyttsx3 as selected; actual engine errors surface at playback."""
+        return True
 
     def _resolve_piper_voice_path(self, voice: str) -> Path | None:
         """Find a Piper ONNX voice by explicit path or voice id."""
-        if not voice:
-            return None
-
-        candidate = Path(voice).expanduser()
-        if candidate.suffix.lower() == ".onnx" and candidate.exists():
-            return candidate
-
-        data_dir = self._piper_data_dir
-        if not data_dir.is_absolute():
-            data_dir = Path(__file__).resolve().parents[1] / data_dir
-
-        candidates = [
-            data_dir / f"{voice}.onnx",
-            data_dir / voice / f"{voice}.onnx",
-            data_dir / voice,
-        ]
-        for path in candidates:
-            if path.suffix.lower() == ".onnx" and path.exists():
-                return path
-        return None
+        return _resolve_piper_voice_path(voice, self.settings)
 
     def _piper_synthesis_config(self):
         """Build Piper synthesis config when the installed version supports it."""
@@ -746,7 +834,16 @@ class TextToSpeech:
         """Update the active voice preset used by subsequent speech calls."""
         if not new_voice:
             return
+        if new_voice == self.voice:
+            return
         self.voice = new_voice
+        if self.backend == "piper":
+            self.stop(wait=False, release_owner=False)
+            self._piper_voice = None
+            self._piper_voice_path = None
+            self.backend_available = False
+            self.backend_error = ""
+            self._configure_backend()
 
     def _parse_blended_voice(self, voice: str) -> tuple[str, str, float] | None:
         """Parse blended voice syntax: voice_a+voice_b@ratio."""
@@ -983,6 +1080,8 @@ class TextToSpeech:
         """Speak a single chunk using the pyttsx3 backend."""
         if self._stop_requested.is_set():
             return
+        if self._speak_with_macos_say_chunks([text]):
+            return
 
         def render_and_play():
             engine = self._create_engine()
@@ -1005,42 +1104,59 @@ class TextToSpeech:
 
         self._play_audio_exclusive(render_and_play)
 
+    def is_available(self) -> bool:
+        """Return whether the selected backend initialized successfully."""
+        return bool(self.backend_available)
+
+    def status_payload(self) -> dict[str, Any]:
+        """Return the active runtime TTS status."""
+        return {
+            "ok": bool(self.backend_available),
+            "backend": self.backend,
+            "voice": self.voice,
+            "strict": True,
+            "error": self.backend_error,
+        }
+
+    def _require_backend_ready(self):
+        if self.backend_available:
+            return
+        message = self.backend_error or f"{self.backend} is not available."
+        raise TTSBackendUnavailable(message)
+
+    def _mark_runtime_error(self, message: str):
+        self.backend_available = False
+        self.backend_error = message
+        print(f"[Mouth] {message}")
+
     def _speak_chunks(self, text: str):
         """Play chunks through the active backend until completed or stopped."""
-        # Use the selected backend
-        if (
-            self.backend == "waveglow"
-            and self._waveglow_synth is not None
-            and sd is not None
-        ):
+        self._require_backend_ready()
+        if self.backend == "waveglow":
             self._speak_with_waveglow(text)
             return
 
-        if (
-            self.backend == "kokoro"
-            and self._kokoro_pipeline is not None
-            and sd is not None
-        ):
+        if self.backend == "kokoro":
             self._speak_with_kokoro(text)
             return
 
-        if self.backend == "piper" and self._piper_voice is not None and sd is not None:
+        if self.backend == "piper":
             self._speak_with_piper(text)
             return
 
-        self._speak_with_engine_chunks(text)
+        if self.backend == "pyttsx3":
+            self._speak_with_engine_chunks(text)
+            return
+
+        self._mark_runtime_error(f"Unsupported TTS backend selected: {self.backend}")
+        raise TTSBackendUnavailable(self.backend_error)
 
     def _speak_with_waveglow(self, text: str):
         """Speak text with WaveGlow and stream generated audio through sounddevice."""
         if self._waveglow_synth is None or sd is None:
-            print("[Mouth] WaveGlow synthesizer not initialized, using fallback")
             self._waveglow_failed = True
-            # Fall through to kokoro or pyttsx3
-            if self._kokoro_pipeline is not None and sd is not None:
-                self._speak_with_kokoro(text)
-            else:
-                self._speak_with_engine_chunks(text)
-            return
+            self._mark_runtime_error("WaveGlow is selected, but it is not initialized.")
+            raise TTSBackendUnavailable(self.backend_error)
 
         for chunk in self._iter_chunks(text):
             if self._stop_requested.is_set():
@@ -1053,23 +1169,18 @@ class TextToSpeech:
                     continue
                 self._play_audio(waveform, self._waveglow_synth.sample_rate)
             except Exception as e:
-                # WaveGlow failed, mark it and fall through to next backend
-                print(f"[Mouth] WaveGlow playback error: {e}")
                 self._waveglow_failed = True
-                print(
-                    "[Mouth] Switching to fallback backend for current and remaining text"
+                self._mark_runtime_error(
+                    f"WaveGlow playback failed for the selected backend: {e}"
                 )
-                # Fall back for this chunk and any remaining using kokoro or pyttsx3
-                if self._kokoro_pipeline is not None and sd is not None:
-                    self._speak_with_kokoro(chunk)
-                else:
-                    self._speak_with_engine(chunk)
-                break
+                raise TTSBackendUnavailable(self.backend_error) from e
 
     def _speak_with_engine_chunks(self, text: str):
         """Speak all chunks with one pyttsx3 engine run."""
         chunks = [chunk for chunk in self._iter_chunks(text)]
         if not chunks or self._stop_requested.is_set():
+            return
+        if self._speak_with_macos_say_chunks(chunks):
             return
 
         def render_and_play():
@@ -1106,11 +1217,91 @@ class TextToSpeech:
             except Exception as retry_error:
                 print(f"[Mouth] pyttsx3 retry failed: {retry_error}")
 
+    def _speak_with_macos_say_chunks(self, chunks: list[str]) -> bool:
+        """Use the blocking macOS say command to avoid pyttsx3 overlap."""
+        say_path = shutil.which("say")
+        if (
+            not self._use_macos_say
+            or platform.system() != "Darwin"
+            or say_path is None
+        ):
+            return False
+
+        voice_name = self._resolve_macos_say_voice()
+
+        def render_and_play():
+            self._is_playing.set()
+            try:
+                for chunk in chunks:
+                    if self._stop_requested.is_set():
+                        break
+                    command = [say_path]
+                    if voice_name:
+                        command.extend(["-v", voice_name])
+                    command.append(chunk)
+                    process = subprocess.Popen(command)
+                    with self._lock:
+                        self._active_process = process
+                    try:
+                        while process.poll() is None:
+                            if self._stop_requested.is_set():
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=0.4)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                    process.wait(timeout=0.4)
+                                break
+                            time.sleep(0.02)
+                    finally:
+                        with self._lock:
+                            if self._active_process is process:
+                                self._active_process = None
+            finally:
+                self._is_playing.clear()
+                self._last_playback_end = time.monotonic()
+
+        try:
+            self._play_audio_exclusive(render_and_play)
+            return True
+        except Exception as error:
+            if self._stop_requested.is_set():
+                return True
+            print(f"[Mouth] macOS say playback error: {error}")
+            return False
+
+    def _resolve_macos_say_voice(self) -> str | None:
+        """Translate an installed pyttsx3 voice id to a macOS say voice name."""
+        requested = str(self.voice or "").strip()
+        if not requested or "_" in requested:
+            return None
+
+        if not requested.startswith("com.apple."):
+            return requested
+
+        engine = None
+        try:
+            engine = pyttsx3.init()
+            for voice in engine.getProperty("voices") or []:
+                voice_id = str(getattr(voice, "id", "") or "")
+                if voice_id == requested:
+                    name = str(getattr(voice, "name", "") or "").strip()
+                    return name or None
+        except Exception:
+            return None
+        finally:
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+        return None
+
     def _speak_with_piper(self, text: str):
         """Speak text with Piper and stream audio chunks through sounddevice."""
         if self._piper_voice is None:
-            self._speak_with_engine_chunks(text)
-            return
+            self._mark_runtime_error("Piper is selected, but no Piper voice is loaded.")
+            raise TTSBackendUnavailable(self.backend_error)
 
         syn_config = self._piper_synthesis_config()
         try:
@@ -1137,9 +1328,10 @@ class TextToSpeech:
                         sample_rate = int(getattr(audio_chunk, "sample_rate", 22050))
                         self._play_audio(audio, sample_rate)
         except Exception as error:
-            print(f"[Mouth] Piper playback error: {error}")
-            print("[Mouth] Falling back to pyttsx3 for this response")
-            self._speak_with_engine_chunks(text)
+            self._mark_runtime_error(
+                f"Piper playback failed for the selected backend: {error}"
+            )
+            raise TTSBackendUnavailable(self.backend_error) from error
 
     def _speak_with_kokoro(self, text: str):
         """Speak text with Kokoro-82M and stream generated audio through sounddevice.
@@ -1149,7 +1341,8 @@ class TextToSpeech:
         - af_heart+af_bella@0.7 (70% af_heart, 30% af_bella)
         """
         if self._kokoro_pipeline is None:
-            return
+            self._mark_runtime_error("Kokoro is selected, but it is not initialized.")
+            raise TTSBackendUnavailable(self.backend_error)
 
         blend = self._parse_blended_voice(self.voice)
         if blend is not None and self._kokoro_enable_voice_blend:
@@ -1181,14 +1374,16 @@ class TextToSpeech:
                         return
                     self._play_audio(audio, 24000)
         except Exception as error:
-            print(f"[Mouth] Kokoro playback error: {error}")
-            print("[Mouth] Falling back to pyttsx3 for this response")
-            self._speak_with_engine_chunks(text)
+            self._mark_runtime_error(
+                f"Kokoro playback failed for the selected backend: {error}"
+            )
+            raise TTSBackendUnavailable(self.backend_error) from error
 
     def speak(self, text):
         """Speak text synchronously, replacing any in-flight playback."""
         if not text:
             return
+        self._require_backend_ready()
 
         self._claim_audio_owner()
         self.stop(release_owner=False)
@@ -1208,26 +1403,34 @@ class TextToSpeech:
                     next_text = self._async_queue.pop(0)
                     self._async_queue_condition.notify_all()
 
-                self._speak_chunks(next_text)
+                try:
+                    self._speak_chunks(next_text)
+                except Exception as error:
+                    if self._stop_requested.is_set():
+                        break
+                    print(f"[Mouth] Async speech error: {error}")
         finally:
             self._release_audio_owner()
-
-        with self._async_queue_condition:
-            self._speak_thread = None
-            self._async_queue_condition.notify_all()
+            with self._async_queue_condition:
+                self._speak_thread = None
+                self._async_queue_condition.notify_all()
 
     def speak_async(self, text):
         """Speak text in a background thread so main flow can continue."""
         if not text:
-            return
+            return False
+        if not self.backend_available:
+            message = self.backend_error or f"{self.backend} is not available."
+            print(f"[Mouth] Cannot speak: {message}")
+            return False
 
         cleaned = str(text).strip()
         if not cleaned:
-            return
+            return False
 
         segments = self._split_for_async_queue(cleaned)
         if not segments:
-            return
+            return False
 
         with self._speak_async_lock:
             self._claim_audio_owner()
@@ -1242,7 +1445,7 @@ class TextToSpeech:
 
                     if self._stop_requested.is_set():
                         self._release_audio_owner()
-                        return
+                        return False
 
                     self._async_queue.append(segment)
                     self._async_queue_condition.notify_all()
@@ -1257,6 +1460,7 @@ class TextToSpeech:
                         name="TTSAsyncWorker",
                     )
                     self._speak_thread.start()
+        return True
 
     def wait_until_done(self):
         """Block until the current asynchronous speech thread completes."""
@@ -1286,10 +1490,16 @@ class TextToSpeech:
 
         with self._lock:
             engine = self._active_engine
+            process = self._active_process
 
         if engine is not None:
             try:
                 engine.stop()
+            except Exception:
+                pass
+        if process is not None:
+            try:
+                process.terminate()
             except Exception:
                 pass
 

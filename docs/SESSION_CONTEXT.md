@@ -1,6 +1,6 @@
 # Voice AI Tutor Session Context
 
-Last updated: 2026-06-08
+Last updated: 2026-06-09
 
 ## User Constraints
 
@@ -8,6 +8,8 @@ Last updated: 2026-06-08
 - Do not upgrade dependencies unless they are needed or offer clear value.
 - Prefer llama.cpp as the new efficient local LLM path, while keeping Ollama selectable.
 - Make Piper a first-class selectable TTS option, while keeping Kokoro and pyttsx3.
+- Do not silently switch providers. If a selected TTS backend is unavailable or
+  fails, show the failure instead of substituting another backend.
 
 ## Current Architecture
 
@@ -51,14 +53,23 @@ Last updated: 2026-06-08
   - UI turn timeout: `VOICE_TUTOR_TURN_TIMEOUT_SECONDS`, default `60` seconds.
   - llama.cpp chat socket timeout: `VOICE_TUTOR_LLM_TIMEOUT_SECONDS`, default
     `30` seconds.
-- If the selected backend falls back to pyttsx3, spoken web turns now speak the
-  completed response as one pyttsx3 engine run instead of feeding pyttsx3
-  sentence-by-sentence.
+- Spoken web turns stream sentence chunks through the TTS queue for the selected
+  backend only. The queue has a process-wide playback lock, so this should not
+  overlap voices.
+- TTS selection is strict: Piper, Kokoro, and pyttsx3 do not automatically
+  substitute for each other. `/api/status` exposes `tts_health`, and the UI voice
+  panel shows the selected backend as ready or unavailable.
+- On macOS, the selected pyttsx3 backend uses the blocking local `say` command by
+  default (`TTS_USE_MACOS_SAY=1`) so sentence chunks cannot be queued into
+  overlapping OS speech; Stop terminates the active `say` process.
+- The async TTS worker always marks itself finished in `finally`, even after a
+  pyttsx3 error or interruption, so later responses can speak again.
 - `/api/voices` lists selectable voices for Kokoro, Piper, and pyttsx3. The UI
   Settings drawer has a per-current-subject voice picker and an apply-to-all
   button.
 - Current Piper voice is configured as `en_US-lessac-medium`, but no local Piper
-  `.onnx` model exists under `models/piper/`, so Piper currently falls back.
+  `.onnx` model exists under `models/piper/`, so Piper is currently shown as
+  unavailable until that local voice file is added.
 - llama.cpp is self-managed by default:
   - installs `llama.cpp` with Homebrew if `llama-server` is missing
   - starts Qwen chat on `127.0.0.1:8080`

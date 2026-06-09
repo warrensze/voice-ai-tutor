@@ -367,7 +367,7 @@ class VoiceAgent:
         interrupted = {"text": None}
         barge_stop = threading.Event()
         barge_thread = None
-        stream_speech = self.mouth.backend != "pyttsx3"
+        stream_speech = True
         if self.barge_in_enabled:
             barge_thread = threading.Thread(
                 target=self._listen_for_barge_in,
@@ -402,12 +402,6 @@ class VoiceAgent:
 
             if stream_speech and sentence_buffer.strip() and not interrupted["text"]:
                 self.mouth.speak_async(sentence_buffer.strip())
-            elif (
-                not stream_speech
-                and full_response.strip()
-                and not interrupted["text"]
-            ):
-                self.mouth.speak_async(full_response.strip())
 
             # Keep interruption listening active while queued TTS is still playing.
             while not interrupted["text"] and self.mouth.has_pending_audio():
@@ -491,6 +485,7 @@ class VoiceAgent:
                 active_subject, self.specialist_chains["english"]
             )
             self._set_subject_voice(active_subject)
+            speak_enabled = speak and self.mouth.is_available()
 
             yield {
                 "type": "subject",
@@ -502,6 +497,14 @@ class VoiceAgent:
                 "page_range": chain_inputs.get("page_range", ""),
                 "sources": chain_inputs.get("source_cards", []),
             }
+            if speak and not speak_enabled:
+                yield {
+                    "type": "tts_status",
+                    "ok": False,
+                    "backend": self.mouth.backend,
+                    "voice": self.mouth.voice,
+                    "message": self.mouth.backend_error,
+                }
 
             if stop_requested():
                 self.mouth.stop(wait=False)
@@ -510,7 +513,7 @@ class VoiceAgent:
 
             full_response = ""
             sentence_buffer = ""
-            stream_speech = self.mouth.backend != "pyttsx3"
+            stream_speech = True
             try:
                 for chunk in specialist_chain.stream(chain_inputs):
                     if stop_requested():
@@ -530,7 +533,7 @@ class VoiceAgent:
                     sentence_buffer += content
                     yield {"type": "token", "content": content}
 
-                    if speak and stream_speech and any(
+                    if speak_enabled and stream_speech and any(
                         p in sentence_buffer for p in [".", "!", "?", "\n"]
                     ):
                         clean_sentence = sentence_buffer.strip()
@@ -538,12 +541,9 @@ class VoiceAgent:
                             self.mouth.speak_async(clean_sentence)
                         sentence_buffer = ""
 
-                if speak and stream_speech and sentence_buffer.strip():
+                if speak_enabled and stream_speech and sentence_buffer.strip():
                     self.mouth.speak_async(sentence_buffer.strip())
-                elif speak and not stream_speech and full_response.strip():
-                    self.mouth.speak_async(full_response.strip())
-
-                while speak and self.mouth.has_pending_audio():
+                while speak_enabled and self.mouth.has_pending_audio():
                     if stop_requested():
                         self.mouth.stop(wait=False)
                         yield stop_message("cancelled")

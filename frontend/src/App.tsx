@@ -88,6 +88,13 @@ type StatusPayload = {
     tts_backend: string;
     chat_health: { ok: boolean; error?: string };
     embedding_health: { ok: boolean; error?: string };
+    tts_health?: {
+      ok: boolean;
+      backend: string;
+      voice: string;
+      strict: boolean;
+      error?: string;
+    };
     llamacpp_bootstrap?: {
       status: string;
       message: string;
@@ -195,7 +202,13 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, []);
 
-  const providerOk = Boolean(status?.providers.chat_health.ok && status.providers.embedding_health.ok);
+  const ttsHealth = status?.providers.tts_health;
+  const ttsOk = Boolean(ttsHealth?.ok);
+  const providerOk = Boolean(
+    status?.providers.chat_health.ok &&
+    status.providers.embedding_health.ok &&
+    (!settings.speak_responses || ttsOk)
+  );
   const builtInSources = status?.vector?.builtin_sources || [];
   const llamaStatus = status?.providers.llamacpp_bootstrap;
   const micLabel = useMemo(() => {
@@ -338,8 +351,12 @@ export default function App() {
       if (payload.type === "sources") {
         setSources(payload.sources || []);
       }
+      if (payload.type === "tts_status" && payload.ok === false) {
+        setAppState("thinking");
+        refreshStatus();
+      }
       if (payload.type === "token") {
-        setAppState(settings.speak_responses ? "speaking" : "thinking");
+        setAppState(settings.speak_responses && ttsOk ? "speaking" : "thinking");
         setMessages((current) =>
           current.map((message) =>
             message.id === assistantId
@@ -472,6 +489,7 @@ export default function App() {
   async function testVoice() {
     await api("/api/voice/stop", { method: "POST", body: JSON.stringify({}) });
     await api("/api/voice/test", { method: "POST", body: JSON.stringify({}) });
+    refreshStatus();
   }
 
   return (
@@ -559,6 +577,20 @@ export default function App() {
               </div>
               {llamaStatus?.message && (
                 <p>{llamaStatus.message}</p>
+              )}
+            </div>
+          )}
+          {settings.speak_responses && ttsHealth && (
+            <div className={`model-status ${ttsHealth.ok ? "ready" : "error"}`}>
+              <div className="model-status-head">
+                <span>Voice</span>
+                <strong>{ttsHealth.ok ? "ready" : "unavailable"}</strong>
+              </div>
+              <div className="model-status-line">
+                {ttsHealth.backend} · {ttsHealth.voice || "default"}
+              </div>
+              {!ttsHealth.ok && ttsHealth.error && (
+                <p>{ttsHealth.error}</p>
               )}
             </div>
           )}

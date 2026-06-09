@@ -27,3 +27,15 @@
   cancellation, moved chat generation off the FastAPI event loop, added
   `/api/voice/stop` cancellation of active turn events, and added response
   timeouts.
+
+2026-06-09
+
+- Reported speech only played one sentence and then stopped; restored
+  sentence-chunk speech streaming for pyttsx3 fallback and fixed TTS worker
+  cleanup so future speech starts after errors/stops.
+- Reported speech overlap again, apparently first and second halves of a response
+  speaking at the same time; added macOS `say` subprocess playback for pyttsx3
+  fallback, with one blocking process per chunk and Stop termination support.
+- Clarified that no provider should silently fall back to another provider;
+  changed TTS to strict selected-backend behavior and surfaced `tts_health` in
+  the API/UI.

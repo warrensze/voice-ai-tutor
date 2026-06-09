@@ -41,7 +41,7 @@ from settings_store import (
     update_user_settings,
 )
 from stt_module import SpeechToText
-from tts_module import list_tts_voices, stop_all_tts
+from tts_module import list_tts_voices, stop_all_tts, tts_backend_status
 from vector import get_ingestion_summary
 from voice_agent import VoiceAgent
 
@@ -252,6 +252,7 @@ def _provider_health() -> dict[str, Any]:
         **status,
         "chat_health": _check_url(chat_url),
         "embedding_health": _check_url(embedding_url),
+        "tts_health": tts_backend_status(settings),
         "llamacpp_bootstrap": bootstrap_status,
     }
 
@@ -385,11 +386,23 @@ def preview_asset(asset_id: str):
 async def test_voice(payload: dict[str, Any]):
     _request_turn_stop()
     runtime = _runtime_for_settings()
+    if not runtime.mouth.is_available():
+        return {
+            "ok": False,
+            "backend": runtime.mouth.backend,
+            "voice": runtime.mouth.voice,
+            "error": runtime.mouth.backend_error,
+        }
     text = str(payload.get("text") or "This is the local tutor voice.")
     runtime.mouth.stop(wait=False, release_owner=False)
     stop_all_tts(except_instance=runtime.mouth, wait=False)
-    runtime.mouth.speak_async(text)
-    return {"ok": True, "backend": runtime.mouth.backend}
+    spoken = runtime.mouth.speak_async(text)
+    return {
+        "ok": bool(spoken),
+        "backend": runtime.mouth.backend,
+        "voice": runtime.mouth.voice,
+        "error": "" if spoken else runtime.mouth.backend_error,
+    }
 
 
 @app.post("/api/voice/stop")

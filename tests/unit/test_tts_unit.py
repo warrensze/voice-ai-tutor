@@ -1,5 +1,6 @@
 import sys
 import os
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ SRC_DIR = Path(__file__).resolve().parents[2] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from tts_module import TextToSpeech
+from tts_module import TTSBackendUnavailable, TextToSpeech, tts_backend_status
 
 
 class FakeEngine:
@@ -49,10 +50,59 @@ class FakeEngine:
         self.stopped = True
 
 
+class FakeProcess:
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class BlockingFakeProcess:
+    def __init__(self):
+        self.started = threading.Event()
+        self.terminated = threading.Event()
+        self.killed = False
+
+    def poll(self):
+        self.started.set()
+        return 0 if self.terminated.is_set() else None
+
+    def terminate(self):
+        self.terminated.set()
+
+    def kill(self):
+        self.killed = True
+        self.terminated.set()
+
+    def wait(self, timeout=None):
+        self.terminated.wait(timeout=timeout)
+        return 0
+
+
+class FailingPiperVoice:
+    def synthesize(self, text, **kwargs):
+        raise RuntimeError("piper failed")
+
+
 class TestTextToSpeech(unittest.TestCase):
     def _create_tts(self) -> TextToSpeech:
         with (
-            patch.dict(os.environ, {"TTS_REQUIRE_KOKORO": "0"}, clear=False),
+            patch.dict(
+                os.environ,
+                {"TTS_REQUIRE_KOKORO": "0", "TTS_USE_MACOS_SAY": "0"},
+                clear=False,
+            ),
             patch.multiple(
                 "tts_module",
                 KPipeline=None,
@@ -110,6 +160,55 @@ class TestTextToSpeech(unittest.TestCase):
         self.assertEqual(mock_init.call_count, 2)
         self.assertEqual(working_engine.spoken, ["retry this"])
 
+    def test_selected_piper_does_not_fallback_when_unavailable(self):
+        with (
+            patch.dict(os.environ, {"TTS_USE_MACOS_SAY": "0"}, clear=False),
+            patch.multiple("tts_module", sd=object(), PiperVoice=None),
+        ):
+            tts = TextToSpeech(backend="piper", voice="missing-piper-voice")
+
+        self.assertEqual(tts.backend, "piper")
+        self.assertFalse(tts.is_available())
+        self.assertIn("Piper", tts.backend_error)
+        with patch.object(tts, "_speak_with_engine_chunks") as mock_engine:
+            self.assertFalse(tts.speak_async("hello"))
+            with self.assertRaises(TTSBackendUnavailable):
+                tts.speak("hello")
+        mock_engine.assert_not_called()
+
+    def test_selected_piper_playback_error_does_not_fallback(self):
+        tts = self._create_tts()
+        tts.backend = "piper"
+        tts.backend_available = True
+        tts._piper_voice = FailingPiperVoice()
+
+        with patch.object(tts, "_speak_with_engine_chunks") as mock_engine:
+            with self.assertRaises(TTSBackendUnavailable):
+                tts._speak_chunks("hello")
+
+        mock_engine.assert_not_called()
+        self.assertFalse(tts.is_available())
+        self.assertIn("Piper playback failed", tts.backend_error)
+
+    def test_tts_backend_status_reports_missing_piper_voice(self):
+        settings = type(
+            "Settings",
+            (),
+            {
+                "tts_backend": "piper",
+                "current_subject": "english",
+                "piper_data_dir": "models/piper",
+                "selected_voice": lambda self, subject=None: "missing-piper-voice",
+            },
+        )()
+
+        with patch.multiple("tts_module", sd=object(), PiperVoice=object()):
+            status = tts_backend_status(settings)
+
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["backend"], "piper")
+        self.assertIn("was not found", status["error"])
+
     def test_new_tts_instance_stops_previous_instance_before_speaking(self):
         first = self._create_tts()
         second = self._create_tts()
@@ -160,6 +259,69 @@ class TestTextToSpeech(unittest.TestCase):
 
         tts.wait_until_done()
         self.assertEqual(spoken, chunks)
+
+    def test_async_worker_resets_after_speech_error(self):
+        tts = self._create_tts()
+        attempts = []
+
+        def fail_once(text: str):
+            attempts.append(text)
+            raise RuntimeError("temporary speech failure")
+
+        tts._speak_chunks = fail_once
+        tts.speak_async("First response.")
+        tts.wait_until_done()
+        self.assertIsNone(tts._speak_thread)
+
+        spoken: list[str] = []
+        tts._speak_chunks = lambda text: spoken.append(text)
+        tts.speak_async("Second response.")
+        tts.wait_until_done()
+
+        self.assertEqual(attempts, ["First response."])
+        self.assertEqual(spoken, ["Second response."])
+
+    def test_macos_say_path_speaks_chunks_sequentially(self):
+        tts = self._create_tts()
+        tts._use_macos_say = True
+        processes = [FakeProcess(), FakeProcess()]
+
+        with (
+            patch("tts_module.platform.system", return_value="Darwin"),
+            patch("tts_module.shutil.which", return_value="/usr/bin/say"),
+            patch("tts_module.subprocess.Popen", side_effect=processes) as mock_popen,
+            patch("tts_module.pyttsx3.init") as mock_init,
+        ):
+            tts._speak_with_engine_chunks("First sentence. Second sentence.")
+
+        self.assertEqual(mock_popen.call_count, 2)
+        self.assertEqual(
+            [call.args[0][-1] for call in mock_popen.call_args_list],
+            ["First sentence.", "Second sentence."],
+        )
+        mock_init.assert_not_called()
+
+    def test_stop_terminates_active_macos_say_process(self):
+        tts = self._create_tts()
+        tts._use_macos_say = True
+        process = BlockingFakeProcess()
+
+        with (
+            patch("tts_module.platform.system", return_value="Darwin"),
+            patch("tts_module.shutil.which", return_value="/usr/bin/say"),
+            patch("tts_module.subprocess.Popen", return_value=process),
+        ):
+            thread = threading.Thread(
+                target=tts._speak_with_engine_chunks,
+                args=("Keep speaking until stopped.",),
+            )
+            thread.start()
+            self.assertTrue(process.started.wait(timeout=1.0))
+            tts.stop(wait=False)
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(process.terminated.is_set())
 
 
 if __name__ == "__main__":
