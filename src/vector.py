@@ -19,12 +19,15 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import chromadb
+from local_providers import create_embedding_model
+from settings_store import PROJECT_ROOT, UserSettings, load_user_settings
 
 # Data locations
 ASSETS_DIR = Path("./assets")
 DB_LOCATION = "./chrome_langchain_db"
 EMBEDDING_MODEL = "mxbai-embed-large"
 COLLECTION_NAME = "langchain"
+USER_VECTOR_DIR = PROJECT_ROOT / "data" / "vector_stores"
 LEGACY_PDF_PATH = ASSETS_DIR / "Grade9GTjoyluckclub.pdf"
 EMBED_CHUNK_SIZE = 500
 EMBED_CHUNK_OVERLAP = 100
@@ -43,6 +46,46 @@ SUBJECT_PDF_PATTERNS = {
         "*joyluckclub*.pdf",
     ],
 }
+
+
+def _safe_key(value: str) -> str:
+    """Return a filesystem-safe key for provider/model-specific vector stores."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value.strip())
+    return cleaned.strip("._") or "default"
+
+
+def _settings_or_default(settings: UserSettings | None = None) -> UserSettings:
+    return settings if settings is not None else load_user_settings()
+
+
+def embedding_model_name(settings: UserSettings | None = None) -> str:
+    """Return the active embedding model name."""
+    active = _settings_or_default(settings)
+    if active.embedding_provider == "ollama":
+        return active.ollama_embedding_model
+    return active.llamacpp_embedding_model
+
+
+def get_vector_db_location(settings: UserSettings | None = None) -> str:
+    """Return a provider/model-specific Chroma directory."""
+    active = _settings_or_default(settings)
+    if (
+        active.embedding_provider == "ollama"
+        and active.ollama_embedding_model == EMBEDDING_MODEL
+    ):
+        return DB_LOCATION
+
+    key = _safe_key(f"{active.embedding_provider}_{embedding_model_name(active)}")
+    return str(USER_VECTOR_DIR / key)
+
+
+def _stamp_embedding_metadata(
+    metadata: dict, settings: UserSettings | None = None
+) -> dict:
+    active = _settings_or_default(settings)
+    metadata["embedding_provider"] = active.embedding_provider
+    metadata["embedding_model"] = embedding_model_name(active)
+    return metadata
 
 
 def discover_subject_pdfs() -> list[tuple[str, Path]]:
@@ -289,7 +332,9 @@ def combine_filters(page_filter, subject_filter):
     return page_filter or subject_filter
 
 
-def ingest_subject_documents(vector_store: Chroma):
+def ingest_subject_documents(
+    vector_store: Chroma, settings: UserSettings | None = None
+):
     """Ingest all discovered subject PDFs that are not yet indexed."""
     subject_pdfs = discover_all_pdfs_with_subjects()
     if not subject_pdfs:
@@ -341,6 +386,8 @@ def ingest_subject_documents(vector_store: Chroma):
 
         for start in range(0, len(chunks), UPSERT_BATCH_SIZE):
             batch = chunks[start : start + UPSERT_BATCH_SIZE]
+            for doc in batch:
+                _stamp_embedding_metadata(doc.metadata, settings)
             # Log page metadata for first chunk to verify storage
             if start == 0 and batch:
                 first_chunk = batch[0]
@@ -354,22 +401,36 @@ def ingest_subject_documents(vector_store: Chroma):
         )
 
 
-def get_vector_store() -> Chroma:
+vector_store = None
+_vector_stores_by_key: dict[str, Chroma] = {}
+
+
+def get_vector_store(settings: UserSettings | None = None) -> Chroma:
     """Create or load vector store and ensure subject documents are indexed."""
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-    vector_store = Chroma(
-        persist_directory=DB_LOCATION,
+    global vector_store
+    active = _settings_or_default(settings)
+    db_location = get_vector_db_location(active)
+    cache_key = f"{active.embedding_provider}:{embedding_model_name(active)}:{db_location}"
+    cached = _vector_stores_by_key.get(cache_key)
+    if cached is not None:
+        return cached
+
+    embeddings = create_embedding_model(active)
+    selected_store = Chroma(
+        persist_directory=db_location,
         embedding_function=embeddings,
     )
 
     # Validate and repair page metadata if needed
-    _validate_and_repair_page_metadata(vector_store)
+    _validate_and_repair_page_metadata(selected_store, db_location)
 
-    ingest_subject_documents(vector_store)
-    return vector_store
+    ingest_subject_documents(selected_store, active)
+    _vector_stores_by_key[cache_key] = selected_store
+    vector_store = selected_store
+    return selected_store
 
 
-def _validate_and_repair_page_metadata(vector_store: Chroma):
+def _validate_and_repair_page_metadata(vector_store: Chroma, db_location: str):
     """Check if existing chunks have proper page metadata; repair if missing."""
     try:
         # Get a sample of existing records to check metadata
@@ -391,7 +452,7 @@ def _validate_and_repair_page_metadata(vector_store: Chroma):
             )
             # Clear the database - it will be rebuilt with proper metadata
             try:
-                db_path = Path(DB_LOCATION)
+                db_path = Path(db_location)
                 if db_path.exists():
                     shutil.rmtree(db_path)
                     print(
@@ -404,9 +465,6 @@ def _validate_and_repair_page_metadata(vector_store: Chroma):
         pass
 
 
-vector_store = None
-
-
 def search_documents(
     query: str,
     *,
@@ -414,6 +472,7 @@ def search_documents(
     start_page: int | None = None,
     end_page: int | None = None,
     k: int = 5,
+    settings: UserSettings | None = None,
 ):
     """Search documents with combined subject and page filters.
 
@@ -428,8 +487,7 @@ def search_documents(
         List of matching documents with filters applied, using fallback strategy if needed
     """
     global vector_store
-    if vector_store is None:
-        vector_store = get_vector_store()
+    active_store = get_vector_store(settings)
 
     # Build filters
     page_filter = build_page_filter(start_page, end_page)
@@ -448,7 +506,7 @@ def search_documents(
         print(f"[Vector] No filters applied")
 
     # Execute search with filters
-    results = vector_store.similarity_search(query, **search_kwargs)
+    results = active_store.similarity_search(query, **search_kwargs)
 
     # Log results with metadata
     print(f"[Vector] Found {len(results)} results")
@@ -470,7 +528,7 @@ def search_documents(
         retry_kwargs = {"k": k * 3}
         if page_filter is not None:
             retry_kwargs["filter"] = page_filter
-        results = vector_store.similarity_search(query, **retry_kwargs)
+        results = active_store.similarity_search(query, **retry_kwargs)
 
         print(f"[Vector] Retry found {len(results)} results with page filter")
         for i, doc in enumerate(results, 1):
@@ -491,7 +549,7 @@ def search_documents(
             expand_kwargs = {"k": k}
             if subject_filter is not None:
                 expand_kwargs["filter"] = subject_filter
-            results = vector_store.similarity_search(query, **expand_kwargs)
+            results = active_store.similarity_search(query, **expand_kwargs)
 
             print(
                 f"[Vector] Expanded search found {len(results)} results "
@@ -557,6 +615,7 @@ def get_retriever(
     subject: str | None = None,
     start_page: int | None = None,
     end_page: int | None = None,
+    settings: UserSettings | None = None,
 ):
     """Create a retriever with optional subject and page range filters.
 
@@ -570,8 +629,7 @@ def get_retriever(
         A LangChain retriever with appropriate filters applied
     """
     global vector_store
-    if vector_store is None:
-        vector_store = get_vector_store()
+    active_store = get_vector_store(settings)
 
     # Build filters
     page_filter = build_page_filter(start_page, end_page)
@@ -582,12 +640,14 @@ def get_retriever(
     if combined_filter is not None:
         search_kwargs["filter"] = combined_filter
 
-    return vector_store.as_retriever(search_kwargs=search_kwargs)
+    return active_store.as_retriever(search_kwargs=search_kwargs)
 
 
-def _get_collection_rows_fast() -> dict:
+def _get_collection_rows_fast(
+    *, settings: UserSettings | None = None, db_location: str | None = None
+) -> dict:
     """Read metadata directly from local Chroma DB without embedding calls."""
-    db_path = Path(DB_LOCATION)
+    db_path = Path(db_location or get_vector_db_location(settings))
     if not db_path.exists():
         return {"ids": [], "metadatas": []}
 
@@ -599,18 +659,20 @@ def _get_collection_rows_fast() -> dict:
         return {"ids": [], "metadatas": []}
 
 
-def get_ingestion_summary(*, ensure_indexed: bool = False) -> dict:
+def get_ingestion_summary(
+    *, ensure_indexed: bool = False, settings: UserSettings | None = None
+) -> dict:
     """Return a summary of indexed chunks grouped by subject and source file.
 
     Set ensure_indexed=True to run embedding-backed ingestion before summarizing.
     """
     rows = None
+    active = _settings_or_default(settings)
     if ensure_indexed:
         global vector_store
-        if vector_store is None:
-            vector_store = get_vector_store()
+        active_store = get_vector_store(active)
         try:
-            rows = vector_store.get(include=["metadatas"])
+            rows = active_store.get(include=["metadatas"])
         except Exception as error:
             return {
                 "total_chunks": 0,
@@ -620,12 +682,19 @@ def get_ingestion_summary(*, ensure_indexed: bool = False) -> dict:
             }
 
     discovered_files = [
-        {"subject": subject, "source_file": path.name}
+        {
+            "subject": subject,
+            "source_file": path.name,
+            "source_path": str(path),
+            "title": path.stem,
+            "file_type": path.suffix.removeprefix(".").lower() or "pdf",
+            "has_ocr_text": get_ocr_text_path(path).exists(),
+        }
         for subject, path in discover_all_pdfs_with_subjects()
     ]
 
     if rows is None:
-        rows = _get_collection_rows_fast()
+        rows = _get_collection_rows_fast(settings=active)
 
     metadatas = rows.get("metadatas") or []
     ids = rows.get("ids") or []
@@ -649,13 +718,72 @@ def get_ingestion_summary(*, ensure_indexed: bool = False) -> dict:
         for file_info in discovered_files
         if file_info["source_file"] not in indexed_source_files
     ]
+    builtin_sources = []
+    pending_keys = {
+        (item["subject"], item["source_file"]) for item in pending_files
+    }
+    for item in discovered_files:
+        subject = item["subject"]
+        source_file = item["source_file"]
+        chunk_count = (
+            summary.get(subject, {}).get("files", {}).get(source_file, 0)
+        )
+        status = (
+            "pending"
+            if (subject, source_file) in pending_keys or chunk_count == 0
+            else "ready"
+        )
+        builtin_sources.append(
+            {
+                **item,
+                "status": status,
+                "chunk_count": chunk_count,
+                "library_asset": False,
+            }
+        )
 
     return {
         "total_chunks": len(ids) or len(metadatas),
         "subjects": summary,
         "discovered_files": discovered_files,
         "pending_files": pending_files,
+        "builtin_sources": builtin_sources,
+        "embedding_provider": active.embedding_provider,
+        "embedding_model": embedding_model_name(active),
+        "db_location": get_vector_db_location(active),
     }
+
+
+def index_documents(
+    documents: list[Document], *, settings: UserSettings | None = None
+) -> int:
+    """Add already-extracted documents to the active vector store."""
+    if not documents:
+        return 0
+
+    active = _settings_or_default(settings)
+    active_store = get_vector_store(active)
+    indexed = 0
+    for start in range(0, len(documents), UPSERT_BATCH_SIZE):
+        batch = documents[start : start + UPSERT_BATCH_SIZE]
+        for doc in batch:
+            _stamp_embedding_metadata(doc.metadata, active)
+        active_store.add_documents(batch)
+        indexed += len(batch)
+    return indexed
+
+
+def delete_documents_for_asset(
+    asset_id: str, *, settings: UserSettings | None = None
+) -> None:
+    """Remove indexed chunks for one user-library asset when supported by Chroma."""
+    if not asset_id:
+        return
+    active_store = get_vector_store(settings)
+    try:
+        active_store.delete(where={"asset_id": asset_id})
+    except Exception as error:
+        print(f"[Vector] Failed to delete chunks for asset {asset_id}: {error}")
 
 
 def print_ingestion_summary():

@@ -26,6 +26,12 @@ dependencies = [
     "pillow",
     "sounddevice",
     "numpy",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "EbookLib",
+    "beautifulsoup4",
+    "piper-tts>=1.4.2",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +45,7 @@ waveglow = [
 
 [project.scripts]
 voice-ai-tutor = "main:main"
+voice-ai-tutor-web = "web_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -47,7 +54,13 @@ py-modules = [
     "persistence",
     "note_taker_agent",
     "main",
+    "web_app",
+    "web_server",
     "voice_agent",
+    "local_providers",
+    "llamacpp_manager",
+    "settings_store",
+    "rag_library",
     "router_agent",
     "history_agent",
     "chemistry_agent",

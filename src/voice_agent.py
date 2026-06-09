@@ -15,7 +15,6 @@ try:
 except ImportError:  # pragma: no cover - msvcrt is Windows-only
     msvcrt = None
 
-from langchain_ollama import ChatOllama
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
@@ -34,10 +33,18 @@ from conversation_utils import (
 )
 from stt_module import SpeechToText
 from tts_module import TextToSpeech
+
+try:
+    from tts_module import stop_all_tts
+except ImportError:  # pragma: no cover - compatibility for lightweight test stubs
+    def stop_all_tts(*, except_instance=None, wait: bool = False):
+        return None
 from vector import search_documents
 from voice_config import load_subject_voice_map
 from persistence import TutorPersistence
 from note_taker_agent import QuestionNoteTakerAgent
+from local_providers import create_chat_model
+from settings_store import UserSettings, load_user_settings
 
 MODEL_NAME = "llama3.1:8b"
 DEFAULT_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "220"))
@@ -87,36 +94,37 @@ def barge_in_passes_threshold(text: str) -> bool:
 class VoiceAgent:
     """Coordinate speech input, LLM responses, TTS output, and memory."""
 
-    def __init__(self):
+    def __init__(
+        self, settings: UserSettings | None = None, *, load_stt: bool = True
+    ):
         """Initialize speech components, memory buffer, and the chat model."""
+        self.settings = settings or load_user_settings()
         self.persistence = TutorPersistence(
             subjects=SUPPORTED_SUBJECTS,
             max_messages_per_subject=PERSISTED_MAX_MESSAGES_PER_SUBJECT,
         )
         self.note_taker = QuestionNoteTakerAgent(self.persistence)
-        self.mouth = TextToSpeech()
-        self.ears = SpeechToText(
-            tts_instance=self.mouth
+        self.mouth = TextToSpeech(settings=self.settings)
+        self.ears = (
+            SpeechToText(tts_instance=self.mouth) if load_stt else None
         )  # Pass TTS reference to prevent self-pickup
         self.memories = {
             subject: InMemoryChatMessageHistory() for subject in SUPPORTED_SUBJECTS
         }
-        self.llm = ChatOllama(
-            model=MODEL_NAME,
-            streaming=True,
-            temperature=0.7,
-            num_predict=DEFAULT_NUM_PREDICT,
-        )
+        self.llm = create_chat_model(self.settings, num_predict=DEFAULT_NUM_PREDICT)
         self.specialist_chains = {
             "history": build_history_chain(self.llm),
             "chemistry": build_chemistry_chain(self.llm),
             "math": build_math_chain(self.llm),
             "english": build_english_chain(self.llm),
         }
-        self.subject_voice_map = load_subject_voice_map()
+        self.subject_voice_map = load_subject_voice_map(
+            backend=self.settings.tts_backend
+        )
         self.source_orchestrator = RunnableLambda(self._orchestrate_chain_inputs)
-        self.current_subject = "english"  # Track the current subject for stickiness
+        self.current_subject = self.settings.current_subject
         self.barge_in_enabled = BARGE_IN_ENABLED
+        self._turn_lock = threading.Lock()
         self._restore_persisted_state()
 
     def _restore_persisted_state(self):
@@ -165,7 +173,9 @@ class VoiceAgent:
     def _set_subject_voice(self, subject: str):
         """Apply per-subject voice settings before speaking the response."""
         selected_subject = subject if subject in self.subject_voice_map else "english"
-        selected_voice = self.subject_voice_map.get(selected_subject)
+        selected_voice = self.settings.selected_voice(selected_subject)
+        if not selected_voice:
+            selected_voice = self.subject_voice_map.get(selected_subject)
         if selected_voice:
             self.mouth.set_voice(selected_voice)
 
@@ -177,14 +187,25 @@ class VoiceAgent:
             subject = "english"
 
         start_page, end_page = extract_page_range(question)
-        source_documents = search_documents(
-            question,
-            subject=subject,
-            start_page=start_page,
-            end_page=end_page,
-            k=5,
-        )
+        retrieval_error = ""
+        try:
+            source_documents = search_documents(
+                question,
+                subject=subject,
+                start_page=start_page,
+                end_page=end_page,
+                k=5,
+                settings=self.settings,
+            )
+        except Exception as error:
+            source_documents = []
+            retrieval_error = str(error)
         source = format_source(source_documents)
+        if retrieval_error:
+            source = (
+                "No source material is currently available because local retrieval "
+                f"is still starting or failed: {retrieval_error}"
+            )
 
         # Log which filters were applied
         filter_info = f"subject={subject}"
@@ -198,9 +219,28 @@ class VoiceAgent:
             "question": question,
             "subject": subject,
             "source": source,
+            "source_cards": self._source_cards(source_documents),
             "page_range": describe_page_range(start_page, end_page),
             "memory_context": self._memory_context(subject),
+            "retrieval_error": retrieval_error,
         }
+
+    def _source_cards(self, source_documents) -> list[dict[str, str]]:
+        """Return compact source metadata for the web UI."""
+        cards = []
+        for doc in source_documents or []:
+            metadata = doc.metadata or {}
+            snippet = " ".join(str(doc.page_content or "").split())[:220]
+            cards.append(
+                {
+                    "source_file": str(metadata.get("source_file") or "unknown"),
+                    "subject": str(metadata.get("subject") or "unknown"),
+                    "page_label": str(metadata.get("page_label") or ""),
+                    "title": str(metadata.get("title") or ""),
+                    "snippet": snippet,
+                }
+            )
+        return cards
 
     def _remember_turn(self, user_input: str, assistant_output: str, subject: str):
         """Persist a completed turn into the selected specialist memory."""
@@ -251,6 +291,8 @@ class VoiceAgent:
 
     def _listen_for_barge_in(self, stop_event: threading.Event, shared_state: dict):
         """Listen in short windows for interruption speech while tutor is speaking."""
+        if self.ears is None:
+            return
         while not stop_event.is_set():
             try:
                 heard = self.ears.listen(
@@ -315,6 +357,7 @@ class VoiceAgent:
         interrupted = {"text": None}
         barge_stop = threading.Event()
         barge_thread = None
+        stream_speech = self.mouth.backend != "pyttsx3"
         if self.barge_in_enabled:
             barge_thread = threading.Thread(
                 target=self._listen_for_barge_in,
@@ -341,14 +384,20 @@ class VoiceAgent:
                 full_response += content
                 sentence_buffer += content
 
-                if any(p in sentence_buffer for p in [".", "!", "?", "\n"]):
+                if stream_speech and any(p in sentence_buffer for p in [".", "!", "?", "\n"]):
                     clean_sentence = sentence_buffer.strip()
                     if clean_sentence:
                         self.mouth.speak_async(clean_sentence)
                     sentence_buffer = ""
 
-            if sentence_buffer.strip() and not interrupted["text"]:
+            if stream_speech and sentence_buffer.strip() and not interrupted["text"]:
                 self.mouth.speak_async(sentence_buffer.strip())
+            elif (
+                not stream_speech
+                and full_response.strip()
+                and not interrupted["text"]
+            ):
+                self.mouth.speak_async(full_response.strip())
 
             # Keep interruption listening active while queued TTS is still playing.
             while not interrupted["text"] and self.mouth.has_pending_audio():
@@ -372,6 +421,82 @@ class VoiceAgent:
 
         print("\n")
         return full_response, None, active_subject
+
+    def stream_ui_turn(self, user_input: str, *, speak: bool = True):
+        """Yield structured events for the browser UI while streaming a turn."""
+        with self._turn_lock:
+            if speak:
+                stop_all_tts(except_instance=self.mouth, wait=False)
+                self.mouth.stop(wait=False, release_owner=False)
+
+            subject, is_explicit_switch = route_subject_sticky(
+                user_input, self.current_subject
+            )
+            self.current_subject = subject
+            try:
+                self.persistence.set_current_subject(subject)
+            except Exception as error:
+                print(f"[Persistence] Failed to update current subject: {error}")
+
+            chain_inputs = self.source_orchestrator.invoke(
+                {"question": user_input, "subject": subject}
+            )
+            active_subject = str(chain_inputs.get("subject") or "english")
+            specialist_chain = self.specialist_chains.get(
+                active_subject, self.specialist_chains["english"]
+            )
+            self._set_subject_voice(active_subject)
+
+            yield {
+                "type": "subject",
+                "subject": active_subject,
+                "explicit_switch": is_explicit_switch,
+            }
+            yield {
+                "type": "sources",
+                "page_range": chain_inputs.get("page_range", ""),
+                "sources": chain_inputs.get("source_cards", []),
+            }
+
+            full_response = ""
+            sentence_buffer = ""
+            stream_speech = self.mouth.backend != "pyttsx3"
+            try:
+                for chunk in specialist_chain.stream(chain_inputs):
+                    content = chunk or ""
+                    if not content:
+                        continue
+                    full_response += content
+                    sentence_buffer += content
+                    yield {"type": "token", "content": content}
+
+                    if speak and stream_speech and any(
+                        p in sentence_buffer for p in [".", "!", "?", "\n"]
+                    ):
+                        clean_sentence = sentence_buffer.strip()
+                        if clean_sentence:
+                            self.mouth.speak_async(clean_sentence)
+                        sentence_buffer = ""
+
+                if speak and stream_speech and sentence_buffer.strip():
+                    self.mouth.speak_async(sentence_buffer.strip())
+                elif speak and not stream_speech and full_response.strip():
+                    self.mouth.speak_async(full_response.strip())
+
+                while speak and self.mouth.has_pending_audio():
+                    time.sleep(PLAYBACK_POLL_SECONDS)
+            except Exception as error:
+                yield {"type": "error", "message": str(error)}
+                return
+
+            if full_response.strip():
+                self._remember_turn(user_input, full_response, active_subject)
+
+            yield {
+                "type": "done",
+                "response": full_response,
+                "subject": active_subject,
+            }
 
     def run(self):
         """Run the main conversational loop until the user exits."""

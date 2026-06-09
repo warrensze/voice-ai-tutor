@@ -2,6 +2,7 @@ import re
 import threading
 import os
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +28,23 @@ except Exception:  # pragma: no cover - optional dependency
     WaveGlowConfig = None
     WaveGlowSynthesizer = None
 
+try:
+    from piper import PiperVoice, SynthesisConfig as PiperSynthesisConfig
+
+    PIPER_IMPORT_ERROR = None
+except Exception as error:  # pragma: no cover - optional dependency
+    PiperVoice = None
+    PiperSynthesisConfig = None
+    PIPER_IMPORT_ERROR = error
+
+try:
+    from settings_store import UserSettings
+except Exception:  # pragma: no cover - settings are optional for legacy use
+    UserSettings = None
+
 
 KOKORO_VOICE_IDS = (
+    "af_heart",
     "af_alloy",
     "af_aoede",
     "af_bella",
@@ -85,17 +101,174 @@ KOKORO_VOICE_IDS = (
 )
 
 
+_TTS_REGISTRY_LOCK = threading.RLock()
+_TTS_PLAYBACK_LOCK = threading.RLock()
+_TTS_INSTANCES = weakref.WeakSet()
+_ACTIVE_TTS_REF = None
+
+
+def stop_all_tts(*, except_instance=None, wait: bool = False):
+    """Stop every TTS instance except the optional current owner."""
+    global _ACTIVE_TTS_REF
+    with _TTS_REGISTRY_LOCK:
+        targets = [
+            instance
+            for instance in list(_TTS_INSTANCES)
+            if instance is not except_instance
+        ]
+        _ACTIVE_TTS_REF = (
+            weakref.ref(except_instance) if except_instance is not None else None
+        )
+    for instance in targets:
+        try:
+            instance.stop(wait=wait, release_owner=False)
+        except Exception:
+            pass
+
+
+def _piper_data_dir_for(settings=None) -> Path:
+    data_dir = Path(
+        getattr(
+            settings,
+            "piper_data_dir",
+            os.getenv("PIPER_DATA_DIR", "models/piper"),
+        )
+    )
+    if not data_dir.is_absolute():
+        data_dir = Path(__file__).resolve().parents[1] / data_dir
+    return data_dir
+
+
+def list_piper_voices(settings=None) -> list[dict[str, Any]]:
+    """Return locally installed Piper voices from the configured model folder."""
+    data_dir = _piper_data_dir_for(settings)
+    if not data_dir.exists():
+        return []
+
+    voices: dict[str, dict[str, Any]] = {}
+    for path in sorted(data_dir.rglob("*.onnx")):
+        voice_id = path.stem
+        if not voice_id or voice_id in voices:
+            continue
+        voices[voice_id] = {
+            "id": voice_id,
+            "label": voice_id.replace("_", " "),
+            "path": str(path.relative_to(data_dir)),
+            "available": True,
+        }
+    return list(voices.values())
+
+
+def list_kokoro_voices(settings=None) -> list[dict[str, Any]]:
+    """Return selectable Kokoro voice ids."""
+    configured = str(getattr(settings, "kokoro_voice", "") or "").strip()
+    configured_and_known = (
+        [configured, *KOKORO_VOICE_IDS] if configured else KOKORO_VOICE_IDS
+    )
+    voice_ids = list(dict.fromkeys(configured_and_known))
+    return [
+        {
+            "id": voice_id,
+            "label": voice_id.replace("_", " "),
+            "available": True,
+        }
+        for voice_id in voice_ids
+        if voice_id
+    ]
+
+
+def list_pyttsx3_voices(settings=None) -> list[dict[str, Any]]:
+    """Return installed system voices exposed through pyttsx3."""
+    options: list[dict[str, Any]] = []
+    engine = None
+    try:
+        engine = pyttsx3.init()
+        for voice in engine.getProperty("voices") or []:
+            voice_id = str(getattr(voice, "id", "") or "").strip()
+            if not voice_id:
+                continue
+            name = str(getattr(voice, "name", "") or voice_id).strip()
+            options.append(
+                {
+                    "id": voice_id,
+                    "label": name,
+                    "available": True,
+                }
+            )
+    except Exception as error:
+        configured = str(getattr(settings, "pyttsx3_voice", "") or "").strip()
+        if configured:
+            options.append(
+                {
+                    "id": configured,
+                    "label": configured,
+                    "available": False,
+                    "error": str(error),
+                }
+            )
+    finally:
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception:
+                pass
+    return options
+
+
+def list_tts_voices(settings=None) -> dict[str, list[dict[str, Any]]]:
+    """Return voice choices grouped by local TTS backend."""
+    voices = {
+        "kokoro": list_kokoro_voices(settings),
+        "piper": list_piper_voices(settings),
+        "pyttsx3": list_pyttsx3_voices(settings),
+    }
+    voices["pyttsx3"].insert(
+        0,
+        {
+            "id": "",
+            "label": "System default",
+            "available": True,
+        },
+    )
+
+    current_piper = str(getattr(settings, "piper_voice", "") or "").strip()
+    if current_piper and all(voice["id"] != current_piper for voice in voices["piper"]):
+        voices["piper"].insert(
+            0,
+            {
+                "id": current_piper,
+                "label": f"{current_piper} (missing)",
+                "available": False,
+            },
+        )
+    return voices
+
+
 class TextToSpeech:
-    def __init__(self, voice: str = "af_heart", speed: float = 1.0):
+    def __init__(
+        self,
+        voice: str = "af_heart",
+        speed: float = 1.0,
+        *,
+        backend: str | None = None,
+        backend_order: str | list[str] | None = None,
+        settings: "UserSettings | None" = None,
+    ):
         """Initialize voice settings and select the best available TTS backend."""
         self.rate = 175
         configured_volume = float(os.getenv("TTS_OUTPUT_VOLUME", "1.0"))
         self.volume = min(1.0, max(0.0, configured_volume))
+        if settings is not None:
+            backend = backend or getattr(settings, "tts_backend", None)
+            voice = settings.selected_voice(getattr(settings, "current_subject", None))
         self.voice = voice
         self.speed = speed
+        self.settings = settings
         self.output_gain = max(0.1, float(os.getenv("TTS_OUTPUT_GAIN", "1.0")))
         self._lock = threading.Lock()
         self._kokoro_lock = threading.Lock()
+        self._piper_lock = threading.Lock()
+        self._speak_async_lock = threading.Lock()
         self._active_engine = None
         self._stop_requested = threading.Event()
         self._speak_thread = None
@@ -106,6 +279,8 @@ class TextToSpeech:
         self._kokoro_pipeline = None
         self._kokoro_assets_ready = False
         self._blend_warning_shown = False
+        self._piper_voice = None
+        self._piper_voice_path = None
         self._waveglow_synth = None
         self._waveglow_failed = False  # Track if WaveGlow had a failure
         self._is_playing = threading.Event()  # Track when audio is being played
@@ -126,6 +301,29 @@ class TextToSpeech:
         self._kokoro_offline_after_preload = os.getenv(
             "KOKORO_OFFLINE_AFTER_PRELOAD", "1"
         ).strip().lower() in {"1", "true", "yes"}
+        self._piper_data_dir = Path(
+            getattr(settings, "piper_data_dir", os.getenv("PIPER_DATA_DIR", "models/piper"))
+        )
+        self._piper_use_cuda = bool(
+            getattr(
+                settings,
+                "piper_use_cuda",
+                os.getenv("PIPER_USE_CUDA", "0").strip().lower()
+                in {"1", "true", "yes"},
+            )
+        )
+        self._piper_length_scale = float(
+            getattr(settings, "piper_length_scale", os.getenv("PIPER_LENGTH_SCALE", "1.0"))
+        )
+        self._piper_noise_scale = float(
+            getattr(settings, "piper_noise_scale", os.getenv("PIPER_NOISE_SCALE", "0.667"))
+        )
+        self._piper_noise_w_scale = float(
+            getattr(settings, "piper_noise_w_scale", os.getenv("PIPER_NOISE_W_SCALE", "0.8"))
+        )
+        self._piper_volume = float(
+            getattr(settings, "piper_volume", os.getenv("PIPER_VOLUME", "1.0"))
+        )
         self._kokoro_marker_path = (
             Path(__file__).resolve().parents[1]
             / f".kokoro_assets_{self._kokoro_repo_id.replace('/', '_')}.ready"
@@ -139,21 +337,31 @@ class TextToSpeech:
             "true",
             "yes",
         }
-        default_order = "kokoro,waveglow,pyttsx3"  # Kokoro-82M is primary
-        configured_order = os.getenv("TTS_BACKEND_ORDER", default_order)
-        requested_order = [
-            name.strip().lower() for name in configured_order.split(",") if name.strip()
-        ]
-        # Force Kokoro to remain first even if an old env var sets a different order.
-        self.backend_order = ["kokoro"] + [
-            name for name in requested_order if name != "kokoro"
-        ]
+        default_order = "kokoro,piper,waveglow,pyttsx3"
+        configured_order = backend_order or os.getenv("TTS_BACKEND_ORDER", default_order)
+        if isinstance(configured_order, str):
+            requested_order = [
+                name.strip().lower()
+                for name in configured_order.split(",")
+                if name.strip()
+            ]
+        else:
+            requested_order = [
+                str(name).strip().lower() for name in configured_order if str(name).strip()
+            ]
+        if backend:
+            selected_backend = str(backend).strip().lower()
+            requested_order = [selected_backend] + [
+                name for name in requested_order if name != selected_backend
+            ]
+        self.backend_order = list(dict.fromkeys(requested_order or ["pyttsx3"]))
         self.backend = "pyttsx3"
         print(
             f"[Mouth] Initializing TTS backend (order: {', '.join(self.backend_order)})"
         )
         self._configure_backend()
-        if self.backend != "kokoro":
+        kokoro_was_primary = self.backend_order and self.backend_order[0] == "kokoro"
+        if self.backend != "kokoro" and kokoro_was_primary:
             message = (
                 f"[Mouth] Kokoro was requested but backend resolved to '{self.backend}'. "
                 "Set TTS_REQUIRE_KOKORO=0 to allow fallback backends."
@@ -162,7 +370,27 @@ class TextToSpeech:
                 raise RuntimeError(message)
             print(message)
         print(f"[Mouth] Using {self.backend.upper()} backend for speech output")
+        with _TTS_REGISTRY_LOCK:
+            _TTS_INSTANCES.add(self)
         self._start_background_warmup()
+
+    def _claim_audio_owner(self):
+        """Ensure this instance is the only TTS instance allowed to speak."""
+        global _ACTIVE_TTS_REF
+        with _TTS_REGISTRY_LOCK:
+            active = _ACTIVE_TTS_REF() if _ACTIVE_TTS_REF is not None else None
+            if active is self:
+                return
+        stop_all_tts(except_instance=self, wait=False)
+        with _TTS_REGISTRY_LOCK:
+            _ACTIVE_TTS_REF = weakref.ref(self)
+
+    def _release_audio_owner(self):
+        global _ACTIVE_TTS_REF
+        with _TTS_REGISTRY_LOCK:
+            active = _ACTIVE_TTS_REF() if _ACTIVE_TTS_REF is not None else None
+            if active is self:
+                _ACTIVE_TTS_REF = None
 
     def _start_background_warmup(self):
         """Preload heavy TTS backend components to reduce first-response silence."""
@@ -226,21 +454,38 @@ class TextToSpeech:
         waveform = np.clip(waveform * self.output_gain, -1.0, 1.0)
 
         device = self._current_output_device()
-        try:
-            self._is_playing.set()
-            sd.play(waveform, sample_rate, device=device)
-            sd.wait()
-            self._is_playing.clear()
-            self._last_playback_end = time.monotonic()
-            return
-        except Exception:
-            # Retry on system default in case selected output was unavailable.
+        with _TTS_PLAYBACK_LOCK:
             try:
-                sd.play(waveform, sample_rate)
+                if self._stop_requested.is_set():
+                    return
+                self._is_playing.set()
+                sd.stop()
+                sd.play(waveform, sample_rate, device=device)
                 sd.wait()
-            finally:
                 self._is_playing.clear()
                 self._last_playback_end = time.monotonic()
+                return
+            except Exception:
+                # Retry on system default in case selected output was unavailable.
+                try:
+                    sd.stop()
+                    sd.play(waveform, sample_rate)
+                    sd.wait()
+                finally:
+                    self._is_playing.clear()
+                    self._last_playback_end = time.monotonic()
+
+    def _play_audio_exclusive(self, render_and_play):
+        """Serialize non-sounddevice engines with the same process-wide speaker lock."""
+        with _TTS_PLAYBACK_LOCK:
+            if self._stop_requested.is_set():
+                return
+            try:
+                if sd is not None:
+                    sd.stop()
+            except Exception:
+                pass
+            render_and_play()
 
     def _configure_backend(self):
         """Select the first available backend from configured backend order."""
@@ -264,6 +509,15 @@ class TextToSpeech:
                 else:
                     print(
                         "[Mouth] Kokoro backend initialization failed, trying next backend"
+                    )
+            elif candidate == "piper":
+                if self._init_piper_backend():
+                    print("[Mouth] Piper backend initialized successfully")
+                    self.backend = "piper"
+                    return
+                else:
+                    print(
+                        "[Mouth] Piper backend initialization failed, trying next backend"
                     )
             elif candidate == "pyttsx3":
                 print("[Mouth] Falling back to pyttsx3 backend")
@@ -405,6 +659,76 @@ class TextToSpeech:
             print(f"[Mouth] Failed to initialize WaveGlowSynthesizer: {e}")
             self._waveglow_synth = None
             return False
+
+    def _init_piper_backend(self) -> bool:
+        """Initialize Piper with a local ONNX voice file."""
+        if sd is None:
+            print("[Mouth] Piper dependency not available: sounddevice")
+            return False
+        if PiperVoice is None:
+            print(
+                "[Mouth] Piper import failed. "
+                f"Original error: {repr(PIPER_IMPORT_ERROR)}"
+            )
+            return False
+
+        voice_path = self._resolve_piper_voice_path(self.voice)
+        if voice_path is None:
+            print(
+                f"[Mouth] Piper voice '{self.voice}' was not found in "
+                f"{self._piper_data_dir}."
+            )
+            return False
+
+        try:
+            self._piper_voice = PiperVoice.load(
+                str(voice_path),
+                use_cuda=self._piper_use_cuda,
+            )
+            self._piper_voice_path = voice_path
+            return True
+        except Exception as error:
+            print(f"[Mouth] Failed to load Piper voice {voice_path}: {error}")
+            self._piper_voice = None
+            self._piper_voice_path = None
+            return False
+
+    def _resolve_piper_voice_path(self, voice: str) -> Path | None:
+        """Find a Piper ONNX voice by explicit path or voice id."""
+        if not voice:
+            return None
+
+        candidate = Path(voice).expanduser()
+        if candidate.suffix.lower() == ".onnx" and candidate.exists():
+            return candidate
+
+        data_dir = self._piper_data_dir
+        if not data_dir.is_absolute():
+            data_dir = Path(__file__).resolve().parents[1] / data_dir
+
+        candidates = [
+            data_dir / f"{voice}.onnx",
+            data_dir / voice / f"{voice}.onnx",
+            data_dir / voice,
+        ]
+        for path in candidates:
+            if path.suffix.lower() == ".onnx" and path.exists():
+                return path
+        return None
+
+    def _piper_synthesis_config(self):
+        """Build Piper synthesis config when the installed version supports it."""
+        if PiperSynthesisConfig is None:
+            return None
+        try:
+            return PiperSynthesisConfig(
+                volume=self._piper_volume,
+                length_scale=self._piper_length_scale,
+                noise_scale=self._piper_noise_scale,
+                noise_w_scale=self._piper_noise_w_scale,
+            )
+        except Exception:
+            return None
 
     def is_audio_playing(self) -> bool:
         """Return True if audio is currently being played through speakers."""
@@ -657,19 +981,29 @@ class TextToSpeech:
 
     def _speak_with_engine(self, text: str):
         """Speak a single chunk using the pyttsx3 backend."""
-        engine = self._create_engine()
-        try:
+        if self._stop_requested.is_set():
+            return
+
+        def render_and_play():
+            engine = self._create_engine()
             with self._lock:
                 self._active_engine = engine
-            self._is_playing.set()  # Mark as playing during pyttsx3 playback
-            engine.say(text)
-            engine.runAndWait()
-        finally:
-            self._is_playing.clear()  # Clear immediately when done
-            self._last_playback_end = time.monotonic()
-            with self._lock:
-                self._active_engine = None
-            engine.stop()
+            try:
+                self._is_playing.set()
+                engine.say(text)
+                engine.runAndWait()
+            finally:
+                self._is_playing.clear()
+                self._last_playback_end = time.monotonic()
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+                with self._lock:
+                    if self._active_engine is engine:
+                        self._active_engine = None
+
+        self._play_audio_exclusive(render_and_play)
 
     def _speak_chunks(self, text: str):
         """Play chunks through the active backend until completed or stopped."""
@@ -690,21 +1024,11 @@ class TextToSpeech:
             self._speak_with_kokoro(text)
             return
 
-        # Use pyttsx3 (always available)
-        for chunk in self._iter_chunks(text):
-            if self._stop_requested.is_set():
-                return
+        if self.backend == "piper" and self._piper_voice is not None and sd is not None:
+            self._speak_with_piper(text)
+            return
 
-            try:
-                self._speak_with_engine(chunk)
-            except Exception as e:
-                if self._stop_requested.is_set():
-                    return
-                print(f"[Mouth] pyttsx3 error: {e}, retrying")
-                try:
-                    self._speak_with_engine(chunk)
-                except Exception as retry_error:
-                    print(f"[Mouth] pyttsx3 retry failed: {retry_error}")
+        self._speak_with_engine_chunks(text)
 
     def _speak_with_waveglow(self, text: str):
         """Speak text with WaveGlow and stream generated audio through sounddevice."""
@@ -743,20 +1067,79 @@ class TextToSpeech:
                 break
 
     def _speak_with_engine_chunks(self, text: str):
-        """Helper to speak chunks with pyttsx3 engine."""
-        for chunk in self._iter_chunks(text):
+        """Speak all chunks with one pyttsx3 engine run."""
+        chunks = [chunk for chunk in self._iter_chunks(text)]
+        if not chunks or self._stop_requested.is_set():
+            return
+
+        def render_and_play():
+            engine = self._create_engine()
+            with self._lock:
+                self._active_engine = engine
+            try:
+                self._is_playing.set()
+                for chunk in chunks:
+                    if self._stop_requested.is_set():
+                        break
+                    engine.say(chunk)
+                if not self._stop_requested.is_set():
+                    engine.runAndWait()
+            finally:
+                self._is_playing.clear()
+                self._last_playback_end = time.monotonic()
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+                with self._lock:
+                    if self._active_engine is engine:
+                        self._active_engine = None
+
+        try:
+            self._play_audio_exclusive(render_and_play)
+        except Exception as e:
             if self._stop_requested.is_set():
                 return
+            print(f"[Mouth] pyttsx3 error: {e}, retrying")
             try:
-                self._speak_with_engine(chunk)
-            except Exception as e:
-                if self._stop_requested.is_set():
-                    return
-                print(f"[Mouth] pyttsx3 error: {e}, retrying")
-                try:
-                    self._speak_with_engine(chunk)
-                except Exception as retry_error:
-                    print(f"[Mouth] pyttsx3 retry failed: {retry_error}")
+                self._play_audio_exclusive(render_and_play)
+            except Exception as retry_error:
+                print(f"[Mouth] pyttsx3 retry failed: {retry_error}")
+
+    def _speak_with_piper(self, text: str):
+        """Speak text with Piper and stream audio chunks through sounddevice."""
+        if self._piper_voice is None:
+            self._speak_with_engine_chunks(text)
+            return
+
+        syn_config = self._piper_synthesis_config()
+        try:
+            with self._piper_lock:
+                for text_chunk in self._iter_chunks(text):
+                    if self._stop_requested.is_set():
+                        return
+
+                    kwargs = {"syn_config": syn_config} if syn_config is not None else {}
+                    for audio_chunk in self._piper_voice.synthesize(
+                        text_chunk, **kwargs
+                    ):
+                        if self._stop_requested.is_set():
+                            return
+                        audio = np.frombuffer(
+                            audio_chunk.audio_int16_bytes, dtype=np.int16
+                        ).astype(np.float32)
+                        if audio.size == 0:
+                            continue
+                        audio = audio / 32768.0
+                        channels = int(getattr(audio_chunk, "sample_channels", 1) or 1)
+                        if channels > 1 and audio.size % channels == 0:
+                            audio = audio.reshape((-1, channels))
+                        sample_rate = int(getattr(audio_chunk, "sample_rate", 22050))
+                        self._play_audio(audio, sample_rate)
+        except Exception as error:
+            print(f"[Mouth] Piper playback error: {error}")
+            print("[Mouth] Falling back to pyttsx3 for this response")
+            self._speak_with_engine_chunks(text)
 
     def _speak_with_kokoro(self, text: str):
         """Speak text with Kokoro-82M and stream generated audio through sounddevice.
@@ -807,20 +1190,27 @@ class TextToSpeech:
         if not text:
             return
 
-        self.stop()
+        self._claim_audio_owner()
+        self.stop(release_owner=False)
         self._stop_requested.clear()
-        self._speak_chunks(text)
+        try:
+            self._speak_chunks(text)
+        finally:
+            self._release_audio_owner()
 
     def _consume_async_queue(self):
         """Drain queued async speech chunks in order without dropping content."""
-        while not self._stop_requested.is_set():
-            with self._async_queue_condition:
-                if not self._async_queue:
-                    break
-                next_text = self._async_queue.pop(0)
-                self._async_queue_condition.notify_all()
+        try:
+            while not self._stop_requested.is_set():
+                with self._async_queue_condition:
+                    if not self._async_queue:
+                        break
+                    next_text = self._async_queue.pop(0)
+                    self._async_queue_condition.notify_all()
 
-            self._speak_chunks(next_text)
+                self._speak_chunks(next_text)
+        finally:
+            self._release_audio_owner()
 
         with self._async_queue_condition:
             self._speak_thread = None
@@ -839,31 +1229,34 @@ class TextToSpeech:
         if not segments:
             return
 
-        with self._async_queue_condition:
-            self._stop_requested.clear()
-            should_start_worker = (
-                self._speak_thread is None or not self._speak_thread.is_alive()
-            )
-            if should_start_worker:
-                self._speak_thread = threading.Thread(
-                    target=self._consume_async_queue,
-                    daemon=self._async_thread_daemon,
-                    name="TTSAsyncWorker",
+        with self._speak_async_lock:
+            self._claim_audio_owner()
+            with self._async_queue_condition:
+                self._stop_requested.clear()
+                for segment in segments:
+                    while (
+                        len(self._async_queue) >= self._max_async_queue
+                        and not self._stop_requested.is_set()
+                    ):
+                        self._async_queue_condition.wait(timeout=0.05)
+
+                    if self._stop_requested.is_set():
+                        self._release_audio_owner()
+                        return
+
+                    self._async_queue.append(segment)
+                    self._async_queue_condition.notify_all()
+
+                should_start_worker = (
+                    self._speak_thread is None or not self._speak_thread.is_alive()
                 )
-                self._speak_thread.start()
-
-            for segment in segments:
-                while (
-                    len(self._async_queue) >= self._max_async_queue
-                    and not self._stop_requested.is_set()
-                ):
-                    self._async_queue_condition.wait(timeout=0.05)
-
-                if self._stop_requested.is_set():
-                    return
-
-                self._async_queue.append(segment)
-                self._async_queue_condition.notify_all()
+                if should_start_worker:
+                    self._speak_thread = threading.Thread(
+                        target=self._consume_async_queue,
+                        daemon=self._async_thread_daemon,
+                        name="TTSAsyncWorker",
+                    )
+                    self._speak_thread.start()
 
     def wait_until_done(self):
         """Block until the current asynchronous speech thread completes."""
@@ -871,17 +1264,19 @@ class TextToSpeech:
             thread = self._speak_thread
             if not thread or not thread.is_alive():
                 break
+            if thread is threading.current_thread():
+                break
             thread.join()
 
     def has_pending_audio(self) -> bool:
         """Return True while audio is playing or queued for playback."""
         thread = self._speak_thread
         thread_alive = bool(thread and thread.is_alive())
-        with self._async_queue_lock:
+        with self._async_queue_condition:
             queue_has_items = bool(self._async_queue)
         return self._is_playing.is_set() or thread_alive or queue_has_items
 
-    def stop(self, wait: bool = True):
+    def stop(self, wait: bool = True, *, release_owner: bool = True):
         """Stop any active speech output across both supported backends."""
         self._stop_requested.set()
 
@@ -898,7 +1293,7 @@ class TextToSpeech:
             except Exception:
                 pass
 
-        if self.backend in {"kokoro", "waveglow"} and sd is not None:
+        if self.backend in {"kokoro", "piper", "waveglow"} and sd is not None:
             try:
                 sd.stop()
             except Exception:
@@ -906,3 +1301,6 @@ class TextToSpeech:
 
         if wait:
             self.wait_until_done()
+
+        if release_owner:
+            self._release_audio_owner()

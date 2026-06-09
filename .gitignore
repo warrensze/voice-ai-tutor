@@ -24,12 +24,19 @@ dist/
 # Editor/OS
 .vscode/
 .python-version
+.DS_Store
 
 # Runtime/generated app artifacts
 error.log
 *.log
 chrome_langchain_db/
 .kokoro_assets_*.ready
+data/
 
 # Local test/generated artifacts
 test_results.txt
+
+# Frontend generated artifacts
+node_modules/
+frontend/node_modules/
+frontend/dist/

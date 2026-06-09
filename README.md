@@ -20,6 +20,61 @@ pip install -e .[waveglow]
 python src/main.py
 ```
 
+## Run Local Web UI
+
+Install Python dependencies, then start the local API/UI server:
+
+```powershell
+pip install -e .
+voice-ai-tutor-web
+```
+
+For frontend development:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173` for Vite development or `http://127.0.0.1:8000`
+after running `npm run build` and `voice-ai-tutor-web`.
+
+The web UI stores local settings in `data/user_settings.json` and user-added
+study assets in `data/library/`.
+
+### Local Provider Switching
+
+The web UI settings drawer supports:
+
+- LLM: `llama.cpp` or `Ollama`
+- TTS: `Piper`, `Kokoro`, or `pyttsx3`
+
+The default llama.cpp path is self-managed. When the UI is opened, the backend
+looks for `llama-server`, installs `llama.cpp` with Homebrew if needed, and starts:
+
+- Chat: `Qwen/Qwen3-8B-GGUF:Q4_K_M`
+- Embeddings: `nomic-ai/nomic-embed-text-v1.5-GGUF:Q4_K_M`
+
+Default local endpoints:
+
+```powershell
+$env:LLAMACPP_CHAT_BASE_URL = "http://127.0.0.1:8080/v1"
+$env:LLAMACPP_EMBED_BASE_URL = "http://127.0.0.1:8081/v1"
+```
+
+Set `LLAMACPP_AUTO_BOOTSTRAP=0` or `LLAMACPP_AUTO_INSTALL=0` only if you want
+to manage llama.cpp manually.
+
+Piper uses local `.onnx` voice files only. Place voices under `models/piper/`
+or update the Piper data directory in the UI settings drawer.
+
+### Study Library
+
+Use the Study Library drawer to upload local PDFs, EPUBs, or OCR text sidecars.
+Files are copied into `data/library/`, extracted locally, embedded locally, and
+indexed into a provider-specific Chroma store.
+
 ### Optional: Enable WaveGlow First
 
 The TTS backend order is configurable with environment variable `TTS_BACKEND_ORDER`.

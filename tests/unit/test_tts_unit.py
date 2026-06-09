@@ -3,7 +3,7 @@ import os
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SRC_DIR = Path(__file__).resolve().parents[2] / "src"
 if str(SRC_DIR) not in sys.path:
@@ -109,6 +109,17 @@ class TestTextToSpeech(unittest.TestCase):
 
         self.assertEqual(mock_init.call_count, 2)
         self.assertEqual(working_engine.spoken, ["retry this"])
+
+    def test_new_tts_instance_stops_previous_instance_before_speaking(self):
+        first = self._create_tts()
+        second = self._create_tts()
+        first.stop = MagicMock()
+        second._speak_chunks = MagicMock()
+
+        second.speak("hello from the selected voice")
+
+        first.stop.assert_called()
+        second._speak_chunks.assert_called_once_with("hello from the selected voice")
 
     def test_split_for_async_queue_preserves_all_text(self):
         tts = self._create_tts()

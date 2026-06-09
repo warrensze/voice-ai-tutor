@@ -21,7 +21,9 @@ def _read_voice_config(config_path: Path) -> dict:
     return loaded
 
 
-def load_subject_voice_map(config_path: str | Path | None = None) -> dict[str, str]:
+def load_subject_voice_map(
+    config_path: str | Path | None = None, *, backend: str = "kokoro"
+) -> dict[str, str]:
     """Load per-subject voices from JSON, with safe defaults."""
     if config_path is None:
         env_value = os.getenv(VOICE_CONFIG_ENV_VAR)
@@ -39,8 +41,14 @@ def load_subject_voice_map(config_path: str | Path | None = None) -> dict[str, s
         print(f"[VoiceConfig] Failed to load {config_path}: {error}")
         return voices
 
+    backend_config = loaded.get(backend)
+    if isinstance(backend_config, dict):
+        loaded_values = backend_config
+    else:
+        loaded_values = loaded
+
     for subject in voices:
-        value = loaded.get(subject)
+        value = loaded_values.get(subject)
         if isinstance(value, str) and value.strip():
             voices[subject] = value.strip()
 

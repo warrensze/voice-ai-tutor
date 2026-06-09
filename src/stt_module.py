@@ -3,6 +3,7 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 import os
 import threading
+from pathlib import Path
 
 # Configuration
 MODEL_SIZE = "base.en"  # 'base.en' is instant; 'distil-large-v3' is higher quality
@@ -552,3 +553,42 @@ class SpeechToText:
                 return ""
 
         return text
+
+    def transcribe_file(self, audio_path: str | Path, *, beam_size: int = 5) -> str:
+        """Transcribe an uploaded audio file with the local Whisper model."""
+        source_path = Path(audio_path)
+        if not source_path.exists():
+            return ""
+
+        def run_transcribe() -> str:
+            segments, _ = self.model.transcribe(
+                str(source_path),
+                beam_size=beam_size,
+                vad_filter=True,
+            )
+            return " ".join(segment.text for segment in segments).strip()
+
+        try:
+            return run_transcribe()
+        except Exception as error:
+            error_text = str(error).lower()
+            if self.active_device == "cuda" and (
+                "cublas" in error_text or "cuda" in error_text
+            ):
+                print(
+                    "[Ears] CUDA runtime failed during file transcription. Retrying on CPU."
+                )
+                try:
+                    self.model = WhisperModel(
+                        MODEL_SIZE,
+                        device="cpu",
+                        compute_type=CPU_COMPUTE_TYPE,
+                    )
+                    self.active_device = "cpu"
+                    return run_transcribe()
+                except Exception as cpu_error:
+                    print(f"[Ears] CPU fallback file transcription failed: {cpu_error}")
+                    return ""
+
+            print(f"[Ears] File transcription failed: {error}")
+            return ""
