@@ -20,6 +20,8 @@ class TestSettingsStore(unittest.TestCase):
             updated = update_user_settings({"llm_provider": "llamacpp"}, path)
             self.assertEqual(updated.llm_provider, "llamacpp")
             self.assertEqual(load_user_settings(path).llm_provider, "llamacpp")
+            self.assertEqual(loaded.kokoro_device, "auto")
+            self.assertTrue(loaded.kokoro_allow_cpu)
 
     def test_invalid_choices_fall_back_to_safe_defaults(self):
         settings = UserSettings.from_dict(
@@ -27,12 +29,14 @@ class TestSettingsStore(unittest.TestCase):
                 "llm_provider": "cloud-provider",
                 "tts_backend": "remote-voice",
                 "current_subject": "astronomy",
+                "kokoro_device": "quantum",
             }
         )
 
         self.assertEqual(settings.llm_provider, "llamacpp")
         self.assertEqual(settings.tts_backend, "piper")
         self.assertEqual(settings.current_subject, "english")
+        self.assertEqual(settings.kokoro_device, "auto")
 
 
 if __name__ == "__main__":

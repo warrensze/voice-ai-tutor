@@ -84,6 +84,9 @@ Last updated: 2026-06-09
 - Kokoro voices are exposed with readable labels by language, gender, and voice
   name, including American English, British English, Spanish, French, Hindi,
   Italian, Japanese, Brazilian Portuguese, and Mandarin Chinese voices.
+- Kokoro device handling is saved in settings. Default `kokoro_device` is `auto`
+  with `kokoro_allow_cpu=true`, so CUDA machines use CUDA and this Mac uses CPU
+  without requiring `KOKORO_ALLOW_CPU=1`.
 - The main voice panel now has an always-visible voice selector and Test button.
   Quick voice selection applies to all subjects for the active TTS backend.
 - UI layout should keep the browser viewport fixed: the chat history and right

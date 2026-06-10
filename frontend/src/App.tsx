@@ -34,6 +34,8 @@ type TutorSettings = {
   piper_voice: string;
   piper_data_dir: string;
   kokoro_voice: string;
+  kokoro_device: "auto" | "cpu" | "cuda";
+  kokoro_allow_cpu: boolean;
   pyttsx3_voice: string;
   subject_voices: Record<string, Record<Subject, string>>;
 };
@@ -92,6 +94,7 @@ type StatusPayload = {
       ok: boolean;
       backend: string;
       voice: string;
+      device?: string;
       strict: boolean;
       error?: string;
     };
@@ -136,6 +139,8 @@ const defaultSettings: TutorSettings = {
   piper_voice: "en_US-lessac-medium",
   piper_data_dir: "models/piper",
   kokoro_voice: "af_heart",
+  kokoro_device: "auto",
+  kokoro_allow_cpu: true,
   pyttsx3_voice: "",
   subject_voices: {
     kokoro: {
@@ -258,6 +263,8 @@ export default function App() {
       "piper_voice",
       "piper_data_dir",
       "kokoro_voice",
+      "kokoro_device",
+      "kokoro_allow_cpu",
       "pyttsx3_voice",
       "subject_voices"
     ];
@@ -618,6 +625,7 @@ export default function App() {
               </div>
               <div className="model-status-line">
                 {ttsHealth.backend} · {ttsHealth.voice || "default"}
+                {ttsHealth.device ? ` · ${ttsHealth.device}` : ""}
               </div>
               {!ttsHealth.ok && ttsHealth.error && (
                 <p>{ttsHealth.error}</p>
@@ -672,6 +680,24 @@ export default function App() {
             options={voiceOptions[settings.tts_backend] || []}
             onChange={saveSubjectVoice}
           />
+          {settings.tts_backend === "kokoro" && (
+            <>
+              <Segmented
+                label="Kokoro device"
+                value={settings.kokoro_device}
+                options={["auto", "cpu", "cuda"]}
+                onChange={(value) => saveSettings({ kokoro_device: value as TutorSettings["kokoro_device"] })}
+              />
+              <label className="toggle-line">
+                <input
+                  type="checkbox"
+                  checked={settings.kokoro_allow_cpu}
+                  onChange={(event) => saveSettings({ kokoro_allow_cpu: event.target.checked })}
+                />
+                Allow CPU Kokoro
+              </label>
+            </>
+          )}
           <button className="secondary-action" onClick={applyVoiceToAllSubjects}>
             <CheckCircle2 size={16} />
             Use voice for all subjects

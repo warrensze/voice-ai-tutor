@@ -11,6 +11,7 @@ from typing import Any
 SUPPORTED_SUBJECTS = ("history", "chemistry", "math", "english")
 LLM_PROVIDERS = ("llamacpp", "ollama")
 TTS_BACKENDS = ("piper", "kokoro", "pyttsx3")
+KOKORO_DEVICES = ("auto", "cpu", "cuda")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -61,6 +62,8 @@ class UserSettings:
     llamacpp_api_key: str = "local"
 
     kokoro_voice: str = "af_heart"
+    kokoro_device: str = "auto"
+    kokoro_allow_cpu: bool = True
     piper_voice: str = "en_US-lessac-medium"
     piper_data_dir: str = "models/piper"
     piper_use_cuda: bool = False
@@ -120,6 +123,10 @@ class UserSettings:
         if settings.llamacpp_embedding_model == "local-embed":
             settings.llamacpp_embedding_model = defaults.llamacpp_embedding_model
         settings.speak_responses = bool(settings.speak_responses)
+        settings.kokoro_device = _clean_choice(
+            settings.kokoro_device, KOKORO_DEVICES, defaults.kokoro_device
+        )
+        settings.kokoro_allow_cpu = bool(settings.kokoro_allow_cpu)
         settings.piper_use_cuda = bool(settings.piper_use_cuda)
         settings.piper_length_scale = _clean_float(settings.piper_length_scale, 1.0)
         settings.piper_noise_scale = _clean_float(settings.piper_noise_scale, 0.667)
@@ -169,6 +176,13 @@ class UserSettings:
             "LLAMACPP_EMBED_MODEL", settings.llamacpp_embedding_model
         )
         settings.piper_voice = os.getenv("PIPER_VOICE", settings.piper_voice)
+        settings.kokoro_voice = os.getenv("KOKORO_VOICE", settings.kokoro_voice)
+        settings.kokoro_device = _clean_choice(
+            os.getenv("KOKORO_DEVICE"), KOKORO_DEVICES, settings.kokoro_device
+        )
+        settings.kokoro_allow_cpu = _env_bool(
+            "KOKORO_ALLOW_CPU", settings.kokoro_allow_cpu
+        )
         settings.piper_data_dir = os.getenv("PIPER_DATA_DIR", settings.piper_data_dir)
         settings.piper_use_cuda = _env_bool("PIPER_USE_CUDA", settings.piper_use_cuda)
         return settings
@@ -191,6 +205,8 @@ class UserSettings:
                 self.current_subject,
                 self.piper_voice,
                 self.kokoro_voice,
+                self.kokoro_device,
+                str(self.kokoro_allow_cpu),
                 self.pyttsx3_voice,
                 json.dumps(self.subject_voices, sort_keys=True),
             ]

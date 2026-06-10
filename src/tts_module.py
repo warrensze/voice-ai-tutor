@@ -238,6 +238,56 @@ def _piper_voice_runtime_error(voice_id: str, settings=None) -> str:
     return ""
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _kokoro_runtime_options(settings=None) -> tuple[str, bool]:
+    requested_device = str(
+        getattr(
+            settings,
+            "kokoro_device",
+            os.getenv("KOKORO_DEVICE", "auto"),
+        )
+        or "auto"
+    ).strip().lower()
+    if requested_device not in {"auto", "cpu", "cuda"}:
+        requested_device = "auto"
+
+    if hasattr(settings, "kokoro_allow_cpu"):
+        allow_cpu = bool(getattr(settings, "kokoro_allow_cpu"))
+    else:
+        allow_cpu = _env_bool("KOKORO_ALLOW_CPU", True)
+    return requested_device, allow_cpu
+
+
+def _resolve_kokoro_device(torch_module, settings=None) -> tuple[str, str]:
+    requested_device, allow_cpu = _kokoro_runtime_options(settings)
+    cuda_available = bool(torch_module.cuda.is_available())
+
+    if requested_device == "auto":
+        resolved_device = "cuda" if cuda_available else "cpu"
+    else:
+        resolved_device = requested_device
+
+    if requested_device == "cuda" and not cuda_available:
+        return (
+            "",
+            "Kokoro is selected for CUDA, but CUDA is unavailable. Choose auto/cpu or enable CPU Kokoro.",
+        )
+
+    if resolved_device == "cpu" and not allow_cpu:
+        return (
+            "",
+            "Kokoro is selected for CPU, but CPU Kokoro is not enabled.",
+        )
+
+    return resolved_device, ""
+
+
 def tts_backend_status(settings=None) -> dict[str, Any]:
     """Return strict health for the selected local TTS backend."""
     backend = str(getattr(settings, "tts_backend", "pyttsx3") or "pyttsx3").strip().lower()
@@ -251,6 +301,7 @@ def tts_backend_status(settings=None) -> dict[str, Any]:
         "ok": False,
         "backend": backend,
         "voice": voice,
+        "device": "",
         "strict": True,
         "error": "",
     }
@@ -281,21 +332,11 @@ def tts_backend_status(settings=None) -> dict[str, Any]:
             result["error"] = f"Kokoro is selected, but PyTorch failed to import: {error}"
             return result
 
-        requested_device = os.getenv("KOKORO_DEVICE", "cuda").strip().lower() or "cuda"
-        allow_cpu = os.getenv("KOKORO_ALLOW_CPU", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        if requested_device.startswith("cuda") and not torch.cuda.is_available():
-            result["error"] = (
-                "Kokoro is selected, but CUDA is unavailable. "
-                "Set KOKORO_ALLOW_CPU=1 if you intentionally want CPU Kokoro."
-            )
+        resolved_device, device_error = _resolve_kokoro_device(torch, settings)
+        if device_error:
+            result["error"] = device_error
             return result
-        if requested_device == "cpu" and not allow_cpu:
-            result["error"] = "Kokoro is selected for CPU, but KOKORO_ALLOW_CPU is not enabled."
-            return result
+        result["device"] = resolved_device
         result["ok"] = True
         return result
 
@@ -733,43 +774,24 @@ class TextToSpeech:
                 f"Kokoro is selected, but PyTorch failed to import: {error}"
             )
 
-        requested_device = os.getenv("KOKORO_DEVICE", "cuda").strip().lower()
-        if not requested_device:
-            requested_device = "cuda"
-
-        allow_cpu = os.getenv("KOKORO_ALLOW_CPU", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-
-        if requested_device.startswith("cuda") and not torch.cuda.is_available():
-            if not allow_cpu:
-                return self._backend_unavailable(
-                    "Kokoro is selected, but CUDA is unavailable. "
-                    "Set KOKORO_ALLOW_CPU=1 if you intentionally want CPU Kokoro."
-                )
-            requested_device = "cpu"
-            print(
-                "[Mouth] CUDA unavailable; using CPU for Kokoro because KOKORO_ALLOW_CPU=1"
-            )
-
-        if requested_device == "cpu" and not allow_cpu:
-            return self._backend_unavailable(
-                "Kokoro is selected for CPU, but KOKORO_ALLOW_CPU is not enabled."
-            )
+        requested_device, _ = _kokoro_runtime_options(self.settings)
+        resolved_device, device_error = _resolve_kokoro_device(torch, self.settings)
+        if device_error:
+            return self._backend_unavailable(device_error)
+        if requested_device == "auto" and resolved_device == "cpu":
+            print("[Mouth] CUDA unavailable; using CPU for Kokoro because Kokoro device is auto")
 
         try:
             self._kokoro_pipeline = KPipeline(
                 lang_code="a",
                 repo_id=self._kokoro_repo_id,
-                device=requested_device,
+                device=resolved_device,
             )
-            if requested_device.startswith("cuda") and torch.cuda.is_available():
+            if resolved_device.startswith("cuda") and torch.cuda.is_available():
                 gpu_name = torch.cuda.get_device_name(0)
                 print(f"[Mouth] Kokoro-82M initialized on CUDA GPU: {gpu_name}")
             else:
-                print(f"[Mouth] Kokoro-82M initialized on {requested_device}")
+                print(f"[Mouth] Kokoro-82M initialized on {resolved_device}")
 
             self._preload_kokoro_assets()
             return True

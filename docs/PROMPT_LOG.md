@@ -54,3 +54,6 @@
 - Reported that the right panels made the whole window scroll, forcing the user
   to hunt for the chat input; fixed the layout so the app shell stays fixed and
   panels scroll internally.
+- Reported Kokoro failed with a CUDA unavailable error; added saved Kokoro
+  device settings so `auto` intentionally uses CPU on this Mac while explicit
+  `cuda` still fails loudly when unavailable.

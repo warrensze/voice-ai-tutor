@@ -103,6 +103,17 @@ class FailingPiperVoice:
         raise RuntimeError("piper failed")
 
 
+class FakeTorchNoCuda:
+    class cuda:
+        @staticmethod
+        def is_available():
+            return False
+
+        @staticmethod
+        def get_device_name(index):
+            return "fake gpu"
+
+
 class TestTextToSpeech(unittest.TestCase):
     def _create_tts(self) -> TextToSpeech:
         with (
@@ -216,6 +227,80 @@ class TestTextToSpeech(unittest.TestCase):
         self.assertFalse(status["ok"])
         self.assertEqual(status["backend"], "piper")
         self.assertIn("was not found", status["error"])
+
+    def test_kokoro_status_auto_uses_cpu_without_cuda(self):
+        settings = type(
+            "Settings",
+            (),
+            {
+                "tts_backend": "kokoro",
+                "current_subject": "english",
+                "kokoro_device": "auto",
+                "kokoro_allow_cpu": True,
+                "selected_voice": lambda self, subject=None: "af_heart",
+            },
+        )()
+
+        with (
+            patch.multiple("tts_module", sd=object(), KPipeline=object()),
+            patch.dict(sys.modules, {"torch": FakeTorchNoCuda}),
+        ):
+            status = tts_backend_status(settings)
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["backend"], "kokoro")
+        self.assertEqual(status["device"], "cpu")
+
+    def test_kokoro_status_cuda_choice_fails_without_cuda(self):
+        settings = type(
+            "Settings",
+            (),
+            {
+                "tts_backend": "kokoro",
+                "current_subject": "english",
+                "kokoro_device": "cuda",
+                "kokoro_allow_cpu": True,
+                "selected_voice": lambda self, subject=None: "af_heart",
+            },
+        )()
+
+        with (
+            patch.multiple("tts_module", sd=object(), KPipeline=object()),
+            patch.dict(sys.modules, {"torch": FakeTorchNoCuda}),
+        ):
+            status = tts_backend_status(settings)
+
+        self.assertFalse(status["ok"])
+        self.assertIn("CUDA is unavailable", status["error"])
+
+    def test_selected_kokoro_auto_initializes_cpu_without_cuda(self):
+        pipeline_calls = []
+
+        def fake_pipeline(**kwargs):
+            pipeline_calls.append(kwargs)
+            return object()
+
+        settings = type(
+            "Settings",
+            (),
+            {
+                "tts_backend": "kokoro",
+                "current_subject": "english",
+                "kokoro_device": "auto",
+                "kokoro_allow_cpu": True,
+                "selected_voice": lambda self, subject=None: "af_heart",
+            },
+        )()
+
+        with (
+            patch.multiple("tts_module", sd=object(), KPipeline=fake_pipeline),
+            patch.dict(sys.modules, {"torch": FakeTorchNoCuda}),
+            patch.object(TextToSpeech, "_preload_kokoro_assets"),
+        ):
+            tts = TextToSpeech(settings=settings)
+
+        self.assertTrue(tts.is_available())
+        self.assertEqual(pipeline_calls[0]["device"], "cpu")
 
     def test_pinyin_piper_voice_requires_g2pw(self):
         with tempfile.TemporaryDirectory() as temp_dir:
