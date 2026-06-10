@@ -40,7 +40,7 @@ from settings_store import (
     settings_status_payload,
     update_user_settings,
 )
-from stt_module import SpeechToText
+from stt_module import STTBackendUnavailable, SpeechToText, stt_backend_status
 from tts_module import list_tts_voices, stop_all_tts, tts_backend_status
 from vector import get_ingestion_summary
 from voice_agent import VoiceAgent
@@ -89,8 +89,9 @@ def _stt_instance() -> SpeechToText:
     global _stt
     with _stt_lock:
         if _stt is None:
+            settings = load_user_settings()
             runtime = _runtime_for_settings()
-            _stt = SpeechToText(tts_instance=runtime.mouth)
+            _stt = SpeechToText(tts_instance=runtime.mouth, settings=settings)
         return _stt
 
 
@@ -255,6 +256,7 @@ def _provider_health() -> dict[str, Any]:
         "chat_health": _check_url(chat_url),
         "embedding_health": _check_url(embedding_url),
         "tts_health": tts_backend_status(settings),
+        "stt_health": stt_backend_status(settings),
         "llamacpp_bootstrap": bootstrap_status,
     }
 
@@ -415,6 +417,7 @@ def stop_voice():
 
 @app.post("/api/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
+    settings = load_user_settings()
     suffix = Path(file.filename or "recording.webm").suffix or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
         tmp_path = Path(handle.name)
@@ -422,10 +425,29 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     try:
         text = _stt_instance().transcribe_file(tmp_path)
+    except STTBackendUnavailable as error:
+        return {
+            "ok": False,
+            "text": "",
+            "provider": settings.stt_provider,
+            "error": str(error),
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "text": "",
+            "provider": settings.stt_provider,
+            "error": f"Transcription failed: {error}",
+        }
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
-    return {"text": text}
+    return {
+        "ok": True,
+        "text": text,
+        "provider": settings.stt_provider,
+        "error": "",
+    }
 
 
 @app.websocket("/ws/chat")

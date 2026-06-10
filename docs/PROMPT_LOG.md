@@ -63,3 +63,8 @@
 - Also fixed built-in asset discovery to use the project-root `assets/`
   directory, avoiding empty source-library discovery when the server runs from
   `src/`.
+- Asked which local STT options should be enabled; narrowed the implementation
+  to `faster-whisper` and `whisper.cpp` with UI provider switching.
+- Asked why the laptop was getting hot; sampled local processes and found iOS
+  Simulator/Xcode services, `WindowServer`, and VS Code GPU/renderer using more
+  CPU than the idle tutor services at that moment.

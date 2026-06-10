@@ -16,6 +16,7 @@ class TestSettingsStore(unittest.TestCase):
 
             self.assertEqual(loaded.llm_provider, "ollama")
             self.assertEqual(loaded.tts_backend, "kokoro")
+            self.assertEqual(loaded.stt_provider, "faster-whisper")
 
             updated = update_user_settings({"llm_provider": "llamacpp"}, path)
             self.assertEqual(updated.llm_provider, "llamacpp")
@@ -28,15 +29,24 @@ class TestSettingsStore(unittest.TestCase):
             {
                 "llm_provider": "cloud-provider",
                 "tts_backend": "remote-voice",
+                "stt_provider": "cloud-stt",
                 "current_subject": "astronomy",
                 "kokoro_device": "quantum",
+                "faster_whisper_device": "neural",
             }
         )
 
         self.assertEqual(settings.llm_provider, "llamacpp")
         self.assertEqual(settings.tts_backend, "piper")
+        self.assertEqual(settings.stt_provider, "faster-whisper")
         self.assertEqual(settings.current_subject, "english")
         self.assertEqual(settings.kokoro_device, "auto")
+        self.assertEqual(settings.faster_whisper_device, "auto")
+
+    def test_stt_provider_aliases_are_normalized(self):
+        settings = UserSettings.from_dict({"stt_provider": "whisper.cpp"})
+
+        self.assertEqual(settings.stt_provider, "whispercpp")
 
 
 if __name__ == "__main__":

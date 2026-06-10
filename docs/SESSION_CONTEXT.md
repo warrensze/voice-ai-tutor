@@ -10,6 +10,8 @@ Last updated: 2026-06-09
 - Make Piper a first-class selectable TTS option, while keeping Kokoro and pyttsx3.
 - Do not silently switch providers. If a selected TTS backend is unavailable or
   fails, show the failure instead of substituting another backend.
+- STT should also be local and explicit: support only `faster-whisper` and
+  `whisper.cpp`, with no hidden provider fallback.
 
 ## Current Architecture
 
@@ -31,6 +33,9 @@ Last updated: 2026-06-09
   - `http://127.0.0.1:8081/v1`
 - Built-in `assets/` RAG sources are indexed for the llama.cpp/Nomic embedding store.
 - Current built-in index size: 19,273 chunks.
+- Browser mic STT defaults to local `faster-whisper` with `base.en`.
+- `whisper.cpp` is now selectable, but it requires local `whisper-cli`, a local
+  GGML model file, and local `ffmpeg` for browser-recorded audio conversion.
 - Local Piper voice models are installed under `models/piper/`:
   - US English: `en_US-lessac-medium`, `en_US-amy-medium`, `en_US-ryan-medium`
   - UK English: `en_GB-alan-medium`, `en_GB-cori-medium`,
@@ -53,6 +58,7 @@ Last updated: 2026-06-09
   - LLM: `llamacpp` or `ollama`
   - embeddings: provider-matched by default
   - TTS: `piper`, `kokoro`, or `pyttsx3`
+  - STT: `faster-whisper` or `whisper.cpp`
 - Only one TTS instance should be active at a time. Backend speech now uses a
   process-wide owner guard plus a process-wide playback lock across Piper,
   Kokoro, WaveGlow, and pyttsx3. UI TTS switches, voice tests, stop actions, and
@@ -107,8 +113,14 @@ Last updated: 2026-06-09
   - starts Qwen chat on `127.0.0.1:8080`
   - starts Nomic embeddings on `127.0.0.1:8081`
 - Piper uses local `.onnx` voices only; no automatic downloads.
-- Browser mic recordings are uploaded to the local backend and transcribed with local faster-whisper.
+- Browser mic recordings are uploaded to the local backend and transcribed with
+  the selected local STT provider. `/api/status` exposes `stt_health`, and the
+  UI settings drawer exposes provider-specific STT settings.
 - Library uploads support PDF, EPUB, and OCR/text files, then index into Chroma with asset metadata.
+- Heat note from the 2026-06-09 process sample: the tutor `web_server` and both
+  `llama-server` processes were nearly idle; the largest CPU users were iOS
+  Simulator/Xcode support processes, `WindowServer`, and VS Code GPU/renderer.
+  `llama-server` can still heat the laptop during active generation/embedding.
 
 ## Useful Commands
 
@@ -120,6 +132,8 @@ Last updated: 2026-06-09
 ## Next Checklist
 
 - Download or place Piper voices under `models/piper/`.
+- If using `whisper.cpp`, install/place `whisper-cli`, a local GGML Whisper
+  model under `models/stt/whisper.cpp/`, and ensure `ffmpeg` is installed.
 - Fix `builtin_sources` in `/api/status`: chunk counts show the built-in
   `assets/` sources are indexed, but the source-list payload is currently empty.
 - Manual audio check: ask one short question and confirm only one sentence/voice

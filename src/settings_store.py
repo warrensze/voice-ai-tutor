@@ -12,6 +12,8 @@ SUPPORTED_SUBJECTS = ("history", "chemistry", "math", "english")
 LLM_PROVIDERS = ("llamacpp", "ollama")
 TTS_BACKENDS = ("piper", "kokoro", "pyttsx3")
 KOKORO_DEVICES = ("auto", "cpu", "cuda")
+STT_PROVIDERS = ("faster-whisper", "whispercpp")
+STT_DEVICES = ("auto", "cpu", "cuda")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -28,6 +30,15 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _clean_choice(value: Any, allowed: tuple[str, ...], default: str) -> str:
     cleaned = str(value or "").strip().lower()
     return cleaned if cleaned in allowed else default
+
+
+def _clean_stt_provider(value: Any, default: str = "faster-whisper") -> str:
+    cleaned = str(value or "").strip().lower().replace("_", "-")
+    if cleaned in {"fasterwhisper", "faster-whisper"}:
+        return "faster-whisper"
+    if cleaned in {"whisper.cpp", "whisper-cpp", "whispercpp"}:
+        return "whispercpp"
+    return default
 
 
 def _clean_subject(value: Any, default: str = "english") -> str:
@@ -48,6 +59,7 @@ class UserSettings:
     llm_provider: str = "llamacpp"
     embedding_provider: str = "llamacpp"
     tts_backend: str = "piper"
+    stt_provider: str = "faster-whisper"
     current_subject: str = "english"
     speak_responses: bool = True
 
@@ -72,6 +84,14 @@ class UserSettings:
     piper_noise_w_scale: float = 0.8
     piper_volume: float = 1.0
     pyttsx3_voice: str = ""
+
+    stt_language: str = "en"
+    faster_whisper_model: str = "base.en"
+    faster_whisper_device: str = "auto"
+    faster_whisper_compute_type: str = "auto"
+    whispercpp_binary_path: str = "whisper-cli"
+    whispercpp_model_path: str = "models/stt/whisper.cpp/ggml-base.en.bin"
+    whispercpp_language: str = "en"
 
     subject_voices: dict[str, dict[str, str]] = field(
         default_factory=lambda: {
@@ -117,6 +137,9 @@ class UserSettings:
         settings.tts_backend = _clean_choice(
             settings.tts_backend, TTS_BACKENDS, defaults.tts_backend
         )
+        settings.stt_provider = _clean_stt_provider(
+            settings.stt_provider, defaults.stt_provider
+        )
         settings.current_subject = _clean_subject(settings.current_subject)
         if settings.llamacpp_chat_model == "local-model":
             settings.llamacpp_chat_model = defaults.llamacpp_chat_model
@@ -125,6 +148,33 @@ class UserSettings:
         settings.speak_responses = bool(settings.speak_responses)
         settings.kokoro_device = _clean_choice(
             settings.kokoro_device, KOKORO_DEVICES, defaults.kokoro_device
+        )
+        settings.faster_whisper_device = _clean_choice(
+            settings.faster_whisper_device,
+            STT_DEVICES,
+            defaults.faster_whisper_device,
+        )
+        settings.stt_language = str(settings.stt_language or "").strip() or "en"
+        settings.faster_whisper_model = (
+            str(settings.faster_whisper_model or "").strip()
+            or defaults.faster_whisper_model
+        )
+        settings.faster_whisper_compute_type = (
+            str(settings.faster_whisper_compute_type or "").strip()
+            or defaults.faster_whisper_compute_type
+        )
+        settings.whispercpp_binary_path = (
+            str(settings.whispercpp_binary_path or "").strip()
+            or defaults.whispercpp_binary_path
+        )
+        settings.whispercpp_model_path = (
+            str(settings.whispercpp_model_path or "").strip()
+            or defaults.whispercpp_model_path
+        )
+        settings.whispercpp_language = (
+            str(settings.whispercpp_language or "").strip()
+            or settings.stt_language
+            or "en"
         )
         settings.kokoro_allow_cpu = bool(settings.kokoro_allow_cpu)
         settings.piper_use_cuda = bool(settings.piper_use_cuda)
@@ -157,6 +207,9 @@ class UserSettings:
         settings.tts_backend = _clean_choice(
             os.getenv("TTS_BACKEND"), TTS_BACKENDS, settings.tts_backend
         )
+        settings.stt_provider = _clean_stt_provider(
+            os.getenv("STT_PROVIDER"), settings.stt_provider
+        )
         settings.ollama_chat_model = os.getenv(
             "OLLAMA_CHAT_MODEL", settings.ollama_chat_model
         )
@@ -185,6 +238,28 @@ class UserSettings:
         )
         settings.piper_data_dir = os.getenv("PIPER_DATA_DIR", settings.piper_data_dir)
         settings.piper_use_cuda = _env_bool("PIPER_USE_CUDA", settings.piper_use_cuda)
+        settings.stt_language = os.getenv("STT_LANGUAGE", settings.stt_language)
+        settings.faster_whisper_model = os.getenv(
+            "FASTER_WHISPER_MODEL", settings.faster_whisper_model
+        )
+        settings.faster_whisper_device = _clean_choice(
+            os.getenv("FASTER_WHISPER_DEVICE"),
+            STT_DEVICES,
+            settings.faster_whisper_device,
+        )
+        settings.faster_whisper_compute_type = os.getenv(
+            "FASTER_WHISPER_COMPUTE_TYPE",
+            settings.faster_whisper_compute_type,
+        )
+        settings.whispercpp_binary_path = os.getenv(
+            "WHISPERCPP_BINARY_PATH", settings.whispercpp_binary_path
+        )
+        settings.whispercpp_model_path = os.getenv(
+            "WHISPERCPP_MODEL_PATH", settings.whispercpp_model_path
+        )
+        settings.whispercpp_language = os.getenv(
+            "WHISPERCPP_LANGUAGE", settings.whispercpp_language
+        )
         return settings
 
     def to_dict(self) -> dict[str, Any]:
@@ -196,6 +271,7 @@ class UserSettings:
                 self.llm_provider,
                 self.embedding_provider,
                 self.tts_backend,
+                self.stt_provider,
                 self.ollama_chat_model,
                 self.ollama_embedding_model,
                 self.llamacpp_chat_base_url,
@@ -208,6 +284,13 @@ class UserSettings:
                 self.kokoro_device,
                 str(self.kokoro_allow_cpu),
                 self.pyttsx3_voice,
+                self.stt_language,
+                self.faster_whisper_model,
+                self.faster_whisper_device,
+                self.faster_whisper_compute_type,
+                self.whispercpp_binary_path,
+                self.whispercpp_model_path,
+                self.whispercpp_language,
                 json.dumps(self.subject_voices, sort_keys=True),
             ]
         )
@@ -291,4 +374,5 @@ def settings_status_payload(settings: UserSettings) -> dict[str, Any]:
         "supported_subjects": list(SUPPORTED_SUBJECTS),
         "llm_providers": list(LLM_PROVIDERS),
         "tts_backends": list(TTS_BACKENDS),
+        "stt_providers": list(STT_PROVIDERS),
     }

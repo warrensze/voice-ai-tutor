@@ -22,6 +22,7 @@ type TutorSettings = {
   llm_provider: "llamacpp" | "ollama";
   embedding_provider: "llamacpp" | "ollama";
   tts_backend: "piper" | "kokoro" | "pyttsx3";
+  stt_provider: "faster-whisper" | "whispercpp";
   current_subject: Subject;
   speak_responses: boolean;
   ollama_base_url: string;
@@ -37,6 +38,13 @@ type TutorSettings = {
   kokoro_device: "auto" | "cpu" | "cuda";
   kokoro_allow_cpu: boolean;
   pyttsx3_voice: string;
+  stt_language: string;
+  faster_whisper_model: string;
+  faster_whisper_device: "auto" | "cpu" | "cuda";
+  faster_whisper_compute_type: string;
+  whispercpp_binary_path: string;
+  whispercpp_model_path: string;
+  whispercpp_language: string;
   subject_voices: Record<string, Record<Subject, string>>;
 };
 
@@ -98,6 +106,16 @@ type StatusPayload = {
       strict: boolean;
       error?: string;
     };
+    stt_health?: {
+      ok: boolean;
+      provider: string;
+      model: string;
+      device: string;
+      strict: boolean;
+      binary?: string;
+      ffmpeg?: string;
+      error?: string;
+    };
     llamacpp_bootstrap?: {
       status: string;
       message: string;
@@ -127,6 +145,7 @@ const defaultSettings: TutorSettings = {
   llm_provider: "llamacpp",
   embedding_provider: "llamacpp",
   tts_backend: "piper",
+  stt_provider: "faster-whisper",
   current_subject: "english",
   speak_responses: true,
   ollama_base_url: "http://127.0.0.1:11434",
@@ -142,6 +161,13 @@ const defaultSettings: TutorSettings = {
   kokoro_device: "auto",
   kokoro_allow_cpu: true,
   pyttsx3_voice: "",
+  stt_language: "en",
+  faster_whisper_model: "base.en",
+  faster_whisper_device: "auto",
+  faster_whisper_compute_type: "auto",
+  whispercpp_binary_path: "whisper-cli",
+  whispercpp_model_path: "models/stt/whisper.cpp/ggml-base.en.bin",
+  whispercpp_language: "en",
   subject_voices: {
     kokoro: {
       history: "am_adam",
@@ -166,6 +192,10 @@ const defaultSettings: TutorSettings = {
 
 function newId() {
   return Math.random().toString(36).slice(2);
+}
+
+function sttProviderLabel(provider: string) {
+  return provider === "whispercpp" ? "whisper.cpp" : provider;
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -208,11 +238,13 @@ export default function App() {
   }, []);
 
   const ttsHealth = status?.providers.tts_health;
+  const sttHealth = status?.providers.stt_health;
   const ttsOk = Boolean(ttsHealth?.ok);
   const providerOk = Boolean(
     status?.providers.chat_health.ok &&
     status.providers.embedding_health.ok &&
-    (!settings.speak_responses || ttsOk)
+    (!settings.speak_responses || ttsOk) &&
+    sttHealth?.ok !== false
   );
   const builtInSources = status?.vector?.builtin_sources || [];
   const llamaStatus = status?.providers.llamacpp_bootstrap;
@@ -257,7 +289,7 @@ export default function App() {
   }
 
   async function saveSettings(patch: Partial<TutorSettings>) {
-    const ttsSettingKeys: Array<keyof TutorSettings> = [
+    const localRuntimeKeys: Array<keyof TutorSettings> = [
       "tts_backend",
       "speak_responses",
       "piper_voice",
@@ -266,10 +298,18 @@ export default function App() {
       "kokoro_device",
       "kokoro_allow_cpu",
       "pyttsx3_voice",
-      "subject_voices"
+      "subject_voices",
+      "stt_provider",
+      "stt_language",
+      "faster_whisper_model",
+      "faster_whisper_device",
+      "faster_whisper_compute_type",
+      "whispercpp_binary_path",
+      "whispercpp_model_path",
+      "whispercpp_language"
     ];
     const shouldStopSpeech =
-      ttsSettingKeys.some((key) => patch[key] !== undefined && patch[key] !== settings[key]) ||
+      localRuntimeKeys.some((key) => patch[key] !== undefined && patch[key] !== settings[key]) ||
       (patch.speak_responses === false && settings.speak_responses);
     if (shouldStopSpeech) {
       await api("/api/voice/stop", { method: "POST", body: JSON.stringify({}) });
@@ -437,6 +477,18 @@ export default function App() {
       recorderRef.current?.stop();
       return;
     }
+    if (sttHealth && !sttHealth.ok) {
+      setMessages((current) => [
+        ...current,
+        {
+          id: newId(),
+          role: "assistant",
+          content: `STT unavailable: ${sttHealth.error || "Selected local speech recognizer is not ready."}`,
+          subject: settings.current_subject
+        }
+      ]);
+      return;
+    }
 
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const recorder = new MediaRecorder(stream);
@@ -451,16 +503,39 @@ export default function App() {
       const form = new FormData();
       form.append("file", blob, "recording.webm");
       try {
-        const result = await api<{ text: string }>("/api/transcribe", {
+        const result = await api<{ ok?: boolean; text: string; provider?: string; error?: string }>("/api/transcribe", {
           method: "POST",
           body: form
         });
+        if (result.ok === false) {
+          setMessages((current) => [
+            ...current,
+            {
+              id: newId(),
+              role: "assistant",
+              content: `STT unavailable: ${result.error || "Transcription failed."}`,
+              subject: settings.current_subject
+            }
+          ]);
+          setAppState("idle");
+          refreshStatus();
+          return;
+        }
         if (result.text) {
           await sendQuestion(result.text);
         } else {
           setAppState("idle");
         }
-      } catch {
+      } catch (error) {
+        setMessages((current) => [
+          ...current,
+          {
+            id: newId(),
+            role: "assistant",
+            content: `Transcription failed: ${error instanceof Error ? error.message : "Unknown local STT error."}`,
+            subject: settings.current_subject
+          }
+        ]);
         setAppState("idle");
       }
     };
@@ -524,6 +599,7 @@ export default function App() {
             <span>Local only</span>
             <span>{settings.llm_provider}</span>
             <span>{settings.tts_backend}</span>
+            <span>{sttProviderLabel(settings.stt_provider)}</span>
           </div>
         </div>
         <div className="topbar-actions">
@@ -604,6 +680,21 @@ export default function App() {
               </button>
             </div>
           </div>
+          {sttHealth && (
+            <div className={`model-status ${sttHealth.ok ? "ready" : "error"}`}>
+              <div className="model-status-head">
+                <span>Speech Input</span>
+                <strong>{sttHealth.ok ? "ready" : "unavailable"}</strong>
+              </div>
+              <div className="model-status-line">
+                {sttProviderLabel(sttHealth.provider)} · {sttHealth.model || "default"}
+                {sttHealth.device ? ` · ${sttHealth.device}` : ""}
+              </div>
+              {!sttHealth.ok && sttHealth.error && (
+                <p>{sttHealth.error}</p>
+              )}
+            </div>
+          )}
           {settings.llm_provider === "llamacpp" && (
             <div className={`model-status ${llamaStatus?.status || "idle"}`}>
               <div className="model-status-head">
@@ -678,6 +769,32 @@ export default function App() {
             options={["piper", "kokoro", "pyttsx3"]}
             onChange={(value) => saveSettings({ tts_backend: value as TutorSettings["tts_backend"] })}
           />
+          <Segmented
+            label="STT"
+            value={settings.stt_provider}
+            options={["faster-whisper", "whispercpp"]}
+            optionLabels={{ whispercpp: "whisper.cpp" }}
+            onChange={(value) => saveSettings({ stt_provider: value as TutorSettings["stt_provider"] })}
+          />
+          {settings.stt_provider === "faster-whisper" ? (
+            <>
+              <SettingsField label="faster-whisper model" value={settings.faster_whisper_model} onChange={(value) => saveSettings({ faster_whisper_model: value })} />
+              <Segmented
+                label="faster-whisper device"
+                value={settings.faster_whisper_device}
+                options={["auto", "cpu", "cuda"]}
+                onChange={(value) => saveSettings({ faster_whisper_device: value as TutorSettings["faster_whisper_device"] })}
+              />
+              <SettingsField label="faster-whisper compute" value={settings.faster_whisper_compute_type} onChange={(value) => saveSettings({ faster_whisper_compute_type: value })} />
+              <SettingsField label="STT language" value={settings.stt_language} onChange={(value) => saveSettings({ stt_language: value })} />
+            </>
+          ) : (
+            <>
+              <SettingsField label="whisper.cpp binary" value={settings.whispercpp_binary_path} onChange={(value) => saveSettings({ whispercpp_binary_path: value })} />
+              <SettingsField label="whisper.cpp model" value={settings.whispercpp_model_path} onChange={(value) => saveSettings({ whispercpp_model_path: value })} />
+              <SettingsField label="whisper.cpp language" value={settings.whispercpp_language} onChange={(value) => saveSettings({ whispercpp_language: value })} />
+            </>
+          )}
           <VoiceSelect
             label={`${settings.current_subject} voice`}
             value={selectedSubjectVoice()}
@@ -822,7 +939,19 @@ function Drawer({ title, onClose, children }: { title: string; onClose: () => vo
   );
 }
 
-function Segmented({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
+function Segmented({
+  label,
+  value,
+  options,
+  optionLabels = {},
+  onChange
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  optionLabels?: Record<string, string>;
+  onChange: (value: string) => void;
+}) {
   return (
     <div className="field">
       <span>{label}</span>
@@ -830,7 +959,7 @@ function Segmented({ label, value, options, onChange }: { label: string; value: 
         {options.map((option) => (
           <button key={option} className={option === value ? "active" : ""} onClick={() => onChange(option)}>
             {option === value && <CheckCircle2 size={14} />}
-            {option}
+            {optionLabels[option] || option}
           </button>
         ))}
       </div>
