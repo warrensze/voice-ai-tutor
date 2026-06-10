@@ -23,8 +23,8 @@ from local_providers import create_embedding_model
 from settings_store import PROJECT_ROOT, UserSettings, load_user_settings
 
 # Data locations
-ASSETS_DIR = Path("./assets")
-DB_LOCATION = "./chrome_langchain_db"
+ASSETS_DIR = PROJECT_ROOT / "assets"
+DB_LOCATION = str(PROJECT_ROOT / "chrome_langchain_db")
 EMBEDDING_MODEL = "mxbai-embed-large"
 COLLECTION_NAME = "langchain"
 USER_VECTOR_DIR = PROJECT_ROOT / "data" / "vector_stores"

@@ -92,6 +92,12 @@ Last updated: 2026-06-09
 - UI layout should keep the browser viewport fixed: the chat history and right
   voice/source panel scroll internally, while the chat input remains visible at
   the bottom of the chat panel.
+- Browser chat turns now send the selected UI subject over the WebSocket. The
+  backend treats that subject as authoritative for specialist routing and RAG
+  filtering; sticky text routing is only used when no UI subject is provided.
+- Built-in RAG discovery uses the project-root `assets/` path, not the process
+  working directory, so web-server startup from `src/` still finds the seeded
+  PDFs.
 - Current Piper voice is configured as `en_US-lessac-medium`; `tts_health` is
   healthy after installing the local Piper voice files.
 - Piper voice labels are formatted for UI readability, such as

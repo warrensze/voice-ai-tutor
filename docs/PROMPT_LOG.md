@@ -57,3 +57,9 @@
 - Reported Kokoro failed with a CUDA unavailable error; added saved Kokoro
   device settings so `auto` intentionally uses CPU on this Mac while explicit
   `cuda` still fails loudly when unavailable.
+- Reported Math selection still retrieved Joy Luck Club/English sources;
+  traced source selection and fixed browser chat so the selected UI subject is
+  sent to the backend and used for RAG filtering.
+- Also fixed built-in asset discovery to use the project-root `assets/`
+  directory, avoiding empty source-library discovery when the server runs from
+  `src/`.

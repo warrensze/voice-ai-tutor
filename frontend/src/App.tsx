@@ -355,7 +355,11 @@ export default function App() {
     wsRef.current = socket;
 
     socket.onopen = () => {
-      socket.send(JSON.stringify({ question: trimmed, speak: settings.speak_responses }));
+      socket.send(JSON.stringify({
+        question: trimmed,
+        subject: settings.current_subject,
+        speak: settings.speak_responses
+      }));
     };
     socket.onmessage = (event) => {
       const payload = JSON.parse(event.data);

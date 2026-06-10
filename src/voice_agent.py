@@ -426,10 +426,20 @@ class VoiceAgent:
         print("\n")
         return full_response, None, active_subject
 
+    def _resolve_turn_subject(
+        self, user_input: str, requested_subject: str | None = None
+    ) -> tuple[str, bool]:
+        """Choose the subject for a turn, honoring explicit UI selection first."""
+        selected_subject = str(requested_subject or "").strip().lower()
+        if selected_subject in self.memories:
+            return selected_subject, selected_subject != self.current_subject
+        return route_subject_sticky(user_input, self.current_subject)
+
     def stream_ui_turn(
         self,
         user_input: str,
         *,
+        subject: str | None = None,
         speak: bool = True,
         stop_event: threading.Event | None = None,
         timeout_seconds: float | None = None,
@@ -468,17 +478,18 @@ class VoiceAgent:
                 stop_all_tts(except_instance=self.mouth, wait=False)
                 self.mouth.stop(wait=False, release_owner=False)
 
-            subject, is_explicit_switch = route_subject_sticky(
-                user_input, self.current_subject
+            turn_subject, is_explicit_switch = self._resolve_turn_subject(
+                user_input,
+                subject,
             )
-            self.current_subject = subject
+            self.current_subject = turn_subject
             try:
-                self.persistence.set_current_subject(subject)
+                self.persistence.set_current_subject(turn_subject)
             except Exception as error:
                 print(f"[Persistence] Failed to update current subject: {error}")
 
             chain_inputs = self.source_orchestrator.invoke(
-                {"question": user_input, "subject": subject}
+                {"question": user_input, "subject": turn_subject}
             )
             active_subject = str(chain_inputs.get("subject") or "english")
             specialist_chain = self.specialist_chains.get(

@@ -130,6 +130,7 @@ async def _send_turn_from_worker(
     runtime: VoiceAgent,
     question: str,
     *,
+    subject: str | None,
     speak: bool,
     stop_event: threading.Event,
 ):
@@ -147,6 +148,7 @@ async def _send_turn_from_worker(
         try:
             for event in runtime.stream_ui_turn(
                 question,
+                subject=subject,
                 speak=speak,
                 stop_event=stop_event,
                 timeout_seconds=UI_TURN_TIMEOUT_SECONDS,
@@ -452,6 +454,7 @@ async def chat_websocket(websocket: WebSocket):
 
             runtime = _runtime_for_settings()
             speak = bool(payload.get("speak", load_user_settings().speak_responses))
+            subject = str(payload.get("subject") or "").strip().lower() or None
             stop_event = threading.Event()
             _register_turn_event(stop_event)
             await websocket.send_json({"type": "status", "status": "thinking"})
@@ -460,6 +463,7 @@ async def chat_websocket(websocket: WebSocket):
                     websocket,
                     runtime,
                     question,
+                    subject=subject,
                     speak=speak,
                     stop_event=stop_event,
                 )

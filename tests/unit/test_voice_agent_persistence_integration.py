@@ -112,8 +112,10 @@ def _build_stub_modules():
     tts_stub = types.ModuleType("tts_module")
 
     class TextToSpeech:
-        def __init__(self):
+        def __init__(self, *args, **kwargs):
             self.voice = ""
+            self.backend = "pyttsx3"
+            self.backend_error = ""
 
         def set_voice(self, voice):
             self.voice = voice
@@ -124,11 +126,14 @@ def _build_stub_modules():
         def has_pending_audio(self):
             return False
 
-        def stop(self, wait=False):
+        def stop(self, wait=False, release_owner=True):
             return wait
 
         def speak(self, text):
             return text
+
+        def is_available(self):
+            return True
 
         def is_audio_playing(self):
             return False
@@ -137,6 +142,7 @@ def _build_stub_modules():
             return False
 
     tts_stub.TextToSpeech = TextToSpeech
+    tts_stub.stop_all_tts = lambda *args, **kwargs: None
     stubs["tts_module"] = tts_stub
 
     vector_stub = types.ModuleType("vector")
@@ -144,8 +150,12 @@ def _build_stub_modules():
     stubs["vector"] = vector_stub
 
     voice_config_stub = types.ModuleType("voice_config")
-    voice_config_stub.load_subject_voice_map = lambda: {}
+    voice_config_stub.load_subject_voice_map = lambda *args, **kwargs: {}
     stubs["voice_config"] = voice_config_stub
+
+    local_providers_stub = types.ModuleType("local_providers")
+    local_providers_stub.create_chat_model = lambda *args, **kwargs: object()
+    stubs["local_providers"] = local_providers_stub
 
     return stubs
 
@@ -199,6 +209,41 @@ class TestVoiceAgentPersistenceIntegration(unittest.TestCase):
             agent.memories["history"].messages[1].content,
             "Sure. What caused World War I?",
         )
+
+    def test_ui_selected_subject_overrides_persisted_sticky_subject(self):
+        persistence = self._new_persistence()
+        persistence.set_current_subject("english")
+        captured_subjects = []
+
+        def fake_search_documents(*args, **kwargs):
+            captured_subjects.append(kwargs.get("subject"))
+            return []
+
+        with (
+            patch.object(
+                self.voice_agent,
+                "TutorPersistence",
+                side_effect=lambda *args, **kwargs: persistence,
+            ),
+            patch.object(
+                self.voice_agent,
+                "search_documents",
+                side_effect=fake_search_documents,
+            ),
+        ):
+            agent = self.voice_agent.VoiceAgent(load_stt=False)
+            events = list(
+                agent.stream_ui_turn(
+                    "Can you explain this part?",
+                    subject="math",
+                    speak=False,
+                )
+            )
+
+        subject_events = [event for event in events if event.get("type") == "subject"]
+        self.assertEqual(agent.current_subject, "math")
+        self.assertEqual(subject_events[0]["subject"], "math")
+        self.assertEqual(captured_subjects, ["math"])
 
     def test_remember_turn_persists_conversation_and_questions(self):
         persistence = self._new_persistence()
