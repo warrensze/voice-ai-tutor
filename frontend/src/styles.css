@@ -265,12 +265,53 @@ button {
   font-weight: 740;
 }
 
+.voice-picker-card {
+  width: 100%;
+  margin-top: 18px;
+  padding: 12px;
+  border: 1px solid rgba(31, 42, 51, 0.1);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.voice-picker-head,
+.voice-picker-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.voice-picker-head {
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: #3d4b55;
+}
+
+.voice-picker-head strong {
+  text-transform: capitalize;
+}
+
+.voice-picker-card .field {
+  margin-bottom: 10px;
+}
+
+.voice-picker-actions {
+  color: #66747e;
+  font-size: 12px;
+}
+
 .stop-button,
 .secondary-action {
   margin-top: 14px;
   min-height: 40px;
   padding: 0 14px;
   border-radius: 8px;
+}
+
+.secondary-action.compact {
+  margin-top: 0;
+  min-height: 34px;
 }
 
 .model-status {

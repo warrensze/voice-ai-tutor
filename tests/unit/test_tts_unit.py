@@ -1,7 +1,9 @@
 import sys
 import os
+import json
 import threading
 import time
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,7 +12,13 @@ SRC_DIR = Path(__file__).resolve().parents[2] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from tts_module import TTSBackendUnavailable, TextToSpeech, tts_backend_status
+from tts_module import (
+    TTSBackendUnavailable,
+    TextToSpeech,
+    list_kokoro_voices,
+    list_piper_voices,
+    tts_backend_status,
+)
 
 
 class FakeEngine:
@@ -208,6 +216,51 @@ class TestTextToSpeech(unittest.TestCase):
         self.assertFalse(status["ok"])
         self.assertEqual(status["backend"], "piper")
         self.assertIn("was not found", status["error"])
+
+    def test_pinyin_piper_voice_requires_g2pw(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voice_path = Path(temp_dir) / "zh_CN-chaowen-medium.onnx"
+            voice_path.write_bytes(b"fake")
+            voice_path.with_suffix(".onnx.json").write_text(
+                json.dumps({"phoneme_type": "pinyin"}),
+                encoding="utf-8",
+            )
+            settings = type(
+                "Settings",
+                (),
+                {
+                    "tts_backend": "piper",
+                    "current_subject": "english",
+                    "piper_data_dir": temp_dir,
+                    "selected_voice": lambda self, subject=None: "zh_CN-chaowen-medium",
+                },
+            )()
+
+            with (
+                patch.multiple("tts_module", sd=object(), PiperVoice=object()),
+                patch("tts_module.importlib.util.find_spec", return_value=None),
+            ):
+                status = tts_backend_status(settings)
+                voices = list_piper_voices(settings)
+
+        self.assertFalse(status["ok"])
+        self.assertIn("g2pw", status["error"])
+        self.assertEqual(voices[0]["id"], "zh_CN-chaowen-medium")
+        self.assertFalse(voices[0]["available"])
+        self.assertIn("g2pw", voices[0]["error"])
+
+    def test_kokoro_voice_labels_are_readable(self):
+        voices = list_kokoro_voices()
+        by_id = {voice["id"]: voice["label"] for voice in voices}
+
+        self.assertEqual(
+            by_id["af_heart"],
+            "American English · Female · Heart",
+        )
+        self.assertEqual(
+            by_id["zf_xiaobei"],
+            "Mandarin Chinese · Female · Xiaobei",
+        )
 
     def test_new_tts_instance_stops_previous_instance_before_speaking(self):
         first = self._create_tts()

@@ -1,6 +1,8 @@
 import re
 import threading
 import os
+import importlib.util
+import json
 import platform
 import shutil
 import subprocess
@@ -167,6 +169,75 @@ def _resolve_piper_voice_path(voice: str, settings=None) -> Path | None:
     return None
 
 
+def _format_piper_voice_label(voice_id: str) -> str:
+    parts = voice_id.split("-")
+    if len(parts) < 3:
+        return voice_id.replace("_", " ")
+
+    locale = parts[0]
+    name = " ".join(parts[1:-1]).replace("_", " ").title()
+    quality = parts[-1].replace("_", " ").title()
+    locale_labels = {
+        "en_US": "US English",
+        "en_GB": "UK English",
+        "zh_CN": "Mandarin Chinese (Mainland)",
+    }
+    language = locale_labels.get(locale, locale.replace("_", "-"))
+    return f"{language} · {name} · {quality}"
+
+
+def _format_kokoro_voice_label(voice_id: str) -> str:
+    if len(voice_id) < 3 or "_" not in voice_id:
+        return voice_id.replace("_", " ")
+
+    prefix, name = voice_id.split("_", 1)
+    language_code = prefix[0]
+    gender_code = prefix[1] if len(prefix) > 1 else ""
+    language_labels = {
+        "a": "American English",
+        "b": "British English",
+        "e": "Spanish",
+        "f": "French",
+        "h": "Hindi",
+        "i": "Italian",
+        "j": "Japanese",
+        "p": "Brazilian Portuguese",
+        "z": "Mandarin Chinese",
+    }
+    gender_labels = {
+        "f": "Female",
+        "m": "Male",
+    }
+    language = language_labels.get(language_code, language_code.upper())
+    gender = gender_labels.get(gender_code, gender_code.upper())
+    display_name = name.replace("_", " ").title()
+    return f"{language} · {gender} · {display_name}"
+
+
+def _piper_voice_runtime_error(voice_id: str, settings=None) -> str:
+    """Return a clear local-runtime error for a Piper voice, or empty if usable."""
+    voice_path = _resolve_piper_voice_path(voice_id, settings)
+    if voice_path is None:
+        return f"voice '{voice_id}' was not found in {_piper_data_dir_for(settings)}."
+
+    config_path = voice_path.with_suffix(voice_path.suffix + ".json")
+    if not config_path.exists():
+        return f"voice '{voice_id}' is missing config file {config_path.name}."
+
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as error:
+        return f"voice '{voice_id}' config could not be read: {error}"
+
+    if (
+        config.get("phoneme_type") == "pinyin"
+        and importlib.util.find_spec("g2pw") is None
+    ):
+        return f"voice '{voice_id}' requires local Python package g2pw for Chinese pinyin phonemization."
+
+    return ""
+
+
 def tts_backend_status(settings=None) -> dict[str, Any]:
     """Return strict health for the selected local TTS backend."""
     backend = str(getattr(settings, "tts_backend", "pyttsx3") or "pyttsx3").strip().lower()
@@ -191,6 +262,8 @@ def tts_backend_status(settings=None) -> dict[str, Any]:
             result["error"] = f"Piper is selected, but the Piper package failed to import: {PIPER_IMPORT_ERROR!r}"
         elif _resolve_piper_voice_path(voice, settings) is None:
             result["error"] = f"Piper is selected, but voice '{voice}' was not found in {_piper_data_dir_for(settings)}."
+        elif runtime_error := _piper_voice_runtime_error(voice, settings):
+            result["error"] = f"Piper is selected, but {runtime_error}"
         else:
             result["ok"] = True
         return result
@@ -267,12 +340,15 @@ def list_piper_voices(settings=None) -> list[dict[str, Any]]:
         voice_id = path.stem
         if not voice_id or voice_id in voices:
             continue
+        runtime_error = _piper_voice_runtime_error(voice_id, settings)
         voices[voice_id] = {
             "id": voice_id,
-            "label": voice_id.replace("_", " "),
+            "label": _format_piper_voice_label(voice_id),
             "path": str(path.relative_to(data_dir)),
-            "available": True,
+            "available": not runtime_error,
         }
+        if runtime_error:
+            voices[voice_id]["error"] = runtime_error
     return list(voices.values())
 
 
@@ -286,7 +362,7 @@ def list_kokoro_voices(settings=None) -> list[dict[str, Any]]:
     return [
         {
             "id": voice_id,
-            "label": voice_id.replace("_", " "),
+            "label": _format_kokoro_voice_label(voice_id),
             "available": True,
         }
         for voice_id in voice_ids
@@ -781,6 +857,8 @@ class TextToSpeech:
                 f"Piper is selected, but voice '{self.voice}' was not found in "
                 f"{_piper_data_dir_for(self.settings)}."
             )
+        if runtime_error := _piper_voice_runtime_error(self.voice, self.settings):
+            return self._backend_unavailable(f"Piper is selected, but {runtime_error}")
 
         try:
             self._piper_voice = PiperVoice.load(

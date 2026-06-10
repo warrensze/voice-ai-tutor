@@ -31,6 +31,20 @@ Last updated: 2026-06-09
   - `http://127.0.0.1:8081/v1`
 - Built-in `assets/` RAG sources are indexed for the llama.cpp/Nomic embedding store.
 - Current built-in index size: 19,273 chunks.
+- Local Piper voice models are installed under `models/piper/`:
+  - US English: `en_US-lessac-medium`, `en_US-amy-medium`, `en_US-ryan-medium`
+  - UK English: `en_GB-alan-medium`, `en_GB-cori-medium`,
+    `en_GB-northern_english_male-medium`,
+    `en_GB-southern_english_female-low`, `en_GB-vctk-medium`
+  - Chinese: `zh_CN-chaowen-medium`, `zh_CN-huayan-medium`,
+    `zh_CN-huayan-x_low`, `zh_CN-xiao_ya-medium`
+  - Current Piper folder size is about `707M`.
+- Working Piper Mandarin voices: `zh_CN-huayan-medium` is the best current
+  choice; `zh_CN-huayan-x_low` also works but is lower quality. Both use the
+  local espeak `cmn` voice.
+- Piper voices `zh_CN-chaowen-medium` and `zh_CN-xiao_ya-medium` require the
+  local Python package `g2pw`; until that is installed, they are shown as
+  unavailable rather than silently failing or switching voices.
 
 ## Implemented Plan
 
@@ -67,9 +81,15 @@ Last updated: 2026-06-09
 - `/api/voices` lists selectable voices for Kokoro, Piper, and pyttsx3. The UI
   Settings drawer has a per-current-subject voice picker and an apply-to-all
   button.
-- Current Piper voice is configured as `en_US-lessac-medium`, but no local Piper
-  `.onnx` model exists under `models/piper/`, so Piper is currently shown as
-  unavailable until that local voice file is added.
+- Kokoro voices are exposed with readable labels by language, gender, and voice
+  name, including American English, British English, Spanish, French, Hindi,
+  Italian, Japanese, Brazilian Portuguese, and Mandarin Chinese voices.
+- The main voice panel now has an always-visible voice selector and Test button.
+  Quick voice selection applies to all subjects for the active TTS backend.
+- Current Piper voice is configured as `en_US-lessac-medium`; `tts_health` is
+  healthy after installing the local Piper voice files.
+- Piper voice labels are formatted for UI readability, such as
+  `UK English · Northern English Male · Medium`.
 - llama.cpp is self-managed by default:
   - installs `llama.cpp` with Homebrew if `llama-server` is missing
   - starts Qwen chat on `127.0.0.1:8080`

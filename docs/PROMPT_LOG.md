@@ -39,3 +39,15 @@
 - Clarified that no provider should silently fall back to another provider;
   changed TTS to strict selected-backend behavior and surfaced `tts_health` in
   the API/UI.
+- Requested a local Piper sampling of English accents and Chinese voices;
+  downloaded US English, UK English, and Chinese Piper `.onnx` plus `.onnx.json`
+  voice files into `models/piper/`.
+- Requested an easy way to choose voices; added an always-visible voice selector
+  and Test button to the main voice panel, with friendlier Piper labels and
+  quick selection applied across all subjects.
+- Reported two Chinese Piper voices were not working and asked for a Mandarin
+  rather than regional-dialect option; identified `zh_CN-huayan-medium` as the
+  best working Mandarin voice and marked pinyin voices unavailable when `g2pw`
+  is missing.
+- Asked for Kokoro voices to be listed and selectable when Kokoro is used; added
+  readable Kokoro voice labels and included Kokoro in the same UI voice picker.

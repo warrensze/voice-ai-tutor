@@ -287,33 +287,44 @@ export default function App() {
     );
   }
 
-  async function saveSubjectVoice(voiceId: string) {
-    const backend = settings.tts_backend;
-    const nextSubjectVoices = {
-      ...settings.subject_voices,
-      [backend]: {
-        ...(settings.subject_voices?.[backend] || {}),
-        [settings.current_subject]: voiceId
-      }
-    };
-    const patch: Partial<TutorSettings> = { subject_voices: nextSubjectVoices };
+  function voicePatch(backend: TutorSettings["tts_backend"], voiceId: string, allSubjects: boolean) {
+    const patch: Partial<TutorSettings> = {};
     if (backend === "piper") patch.piper_voice = voiceId;
     if (backend === "kokoro") patch.kokoro_voice = voiceId;
     if (backend === "pyttsx3") patch.pyttsx3_voice = voiceId;
-    await saveSettings(patch);
+
+    if (allSubjects) {
+      patch.subject_voices = {
+        ...settings.subject_voices,
+        [backend]: subjects.reduce(
+          (acc, subject) => ({ ...acc, [subject]: voiceId }),
+          {} as Record<Subject, string>
+        )
+      };
+    } else {
+      patch.subject_voices = {
+        ...settings.subject_voices,
+        [backend]: {
+          ...(settings.subject_voices?.[backend] || {}),
+          [settings.current_subject]: voiceId
+        }
+      };
+    }
+    return patch;
+  }
+
+  async function saveSubjectVoice(voiceId: string) {
+    const backend = settings.tts_backend;
+    await saveSettings(voicePatch(backend, voiceId, false));
+  }
+
+  async function saveVoiceForAllSubjects(voiceId: string) {
+    const backend = settings.tts_backend;
+    await saveSettings(voicePatch(backend, voiceId, true));
   }
 
   async function applyVoiceToAllSubjects() {
-    const backend = settings.tts_backend;
-    const voiceId = selectedSubjectVoice();
-    const nextSubjectVoices = {
-      ...settings.subject_voices,
-      [backend]: subjects.reduce(
-        (acc, subject) => ({ ...acc, [subject]: voiceId }),
-        {} as Record<Subject, string>
-      )
-    };
-    await saveSettings({ subject_voices: nextSubjectVoices });
+    await saveVoiceForAllSubjects(selectedSubjectVoice());
   }
 
   async function sendQuestion(question: string) {
@@ -563,6 +574,25 @@ export default function App() {
             </button>
           </div>
           <div className="mic-label">{micLabel}</div>
+          <div className="voice-picker-card">
+            <div className="voice-picker-head">
+              <span>Voice</span>
+              <strong>{settings.tts_backend}</strong>
+            </div>
+            <VoiceSelect
+              label="Selected voice"
+              value={selectedSubjectVoice()}
+              options={voiceOptions[settings.tts_backend] || []}
+              onChange={saveVoiceForAllSubjects}
+            />
+            <div className="voice-picker-actions">
+              <span>All subjects</span>
+              <button className="secondary-action compact" onClick={testVoice}>
+                <Volume2 size={16} />
+                Test
+              </button>
+            </div>
+          </div>
           {settings.llm_provider === "llamacpp" && (
             <div className={`model-status ${llamaStatus?.status || "idle"}`}>
               <div className="model-status-head">
@@ -792,9 +822,9 @@ function VoiceSelect({ label, value, options, onChange }: { label: string; value
           <option value="">No local voices found</option>
         ) : (
           renderedOptions.map((option) => (
-            <option key={option.id} value={option.id}>
+            <option key={option.id} value={option.id} disabled={option.available === false}>
               {option.label || option.id}
-              {option.available === false ? " (missing)" : ""}
+              {option.available === false ? " (unavailable)" : ""}
             </option>
           ))
         )}
