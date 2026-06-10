@@ -86,6 +86,9 @@ Last updated: 2026-06-09
   Italian, Japanese, Brazilian Portuguese, and Mandarin Chinese voices.
 - The main voice panel now has an always-visible voice selector and Test button.
   Quick voice selection applies to all subjects for the active TTS backend.
+- UI layout should keep the browser viewport fixed: the chat history and right
+  voice/source panel scroll internally, while the chat input remains visible at
+  the bottom of the chat panel.
 - Current Piper voice is configured as `en_US-lessac-medium`; `tts_health` is
   healthy after installing the local Piper voice files.
 - Piper voice labels are formatted for UI readability, such as

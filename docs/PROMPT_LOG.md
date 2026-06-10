@@ -51,3 +51,6 @@
   is missing.
 - Asked for Kokoro voices to be listed and selectable when Kokoro is used; added
   readable Kokoro voice labels and included Kokoro in the same UI voice picker.
+- Reported that the right panels made the whole window scroll, forcing the user
+  to hunt for the chat input; fixed the layout so the app shell stays fixed and
+  panels scroll internally.
