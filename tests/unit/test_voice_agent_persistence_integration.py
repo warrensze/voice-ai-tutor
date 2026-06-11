@@ -147,6 +147,14 @@ def _build_stub_modules():
 
     vector_stub = types.ModuleType("vector")
     vector_stub.search_documents = lambda *args, **kwargs: []
+    vector_stub.course_label = lambda course: {
+        "algebra_ii": "Algebra II",
+        "precalculus": "Precalculus",
+    }.get(course, "")
+    vector_stub.infer_course_from_filename = lambda _path, subject: (
+        "algebra_ii" if subject == "math" else ""
+    )
+    vector_stub.infer_source_role_from_filename = lambda _path: "textbook"
     stubs["vector"] = vector_stub
 
     voice_config_stub = types.ModuleType("voice_config")
@@ -214,9 +222,13 @@ class TestVoiceAgentPersistenceIntegration(unittest.TestCase):
         persistence = self._new_persistence()
         persistence.set_current_subject("english")
         captured_subjects = []
+        captured_courses = []
+        captured_source_modes = []
 
         def fake_search_documents(*args, **kwargs):
             captured_subjects.append(kwargs.get("subject"))
+            captured_courses.append(kwargs.get("course"))
+            captured_source_modes.append(kwargs.get("source_mode"))
             return []
 
         with (
@@ -236,6 +248,8 @@ class TestVoiceAgentPersistenceIntegration(unittest.TestCase):
                 agent.stream_ui_turn(
                     "Can you explain this part?",
                     subject="math",
+                    course="algebra_ii",
+                    source_mode="textbook",
                     speak=False,
                 )
             )
@@ -244,6 +258,8 @@ class TestVoiceAgentPersistenceIntegration(unittest.TestCase):
         self.assertEqual(agent.current_subject, "math")
         self.assertEqual(subject_events[0]["subject"], "math")
         self.assertEqual(captured_subjects, ["math"])
+        self.assertEqual(captured_courses, ["algebra_ii"])
+        self.assertEqual(captured_source_modes, ["textbook"])
 
     def test_remember_turn_persists_conversation_and_questions(self):
         persistence = self._new_persistence()

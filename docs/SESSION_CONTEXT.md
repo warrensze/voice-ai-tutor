@@ -1,6 +1,6 @@
 # Voice AI Tutor Session Context
 
-Last updated: 2026-06-09
+Last updated: 2026-06-11
 
 ## User Constraints
 
@@ -12,6 +12,8 @@ Last updated: 2026-06-09
   fails, show the failure instead of substituting another backend.
 - STT should also be local and explicit: support only `faster-whisper` and
   `whisper.cpp`, with no hidden provider fallback.
+- Math RAG should scale beyond one book by using visible study sets rather than
+  searching every math source by default.
 
 ## Current Architecture
 
@@ -21,6 +23,9 @@ Last updated: 2026-06-09
 - Saved UI/runtime settings live in `data/user_settings.json`.
 - User-added RAG files live in `data/library/`.
 - Provider-specific vector stores live under `data/vector_stores/`; the legacy Ollama default can still use `chrome_langchain_db`.
+- Math study-set settings live in `data/user_settings.json`:
+  `current_course` (`algebra_ii` or `precalculus`) and `rag_source_mode`
+  (`auto`, `textbook`, `workbook`, or `all`).
 
 ## Current Local Runtime State
 
@@ -33,6 +38,9 @@ Last updated: 2026-06-09
   - `http://127.0.0.1:8081/v1`
 - Built-in `assets/` RAG sources are indexed for the llama.cpp/Nomic embedding store.
 - Current built-in index size: 19,273 chunks.
+- Built-in Algebra 2 is treated as `course=algebra_ii` and
+  `source_role=textbook` by filename alias, so the new study-set filters work
+  without forcing a full vector DB rebuild.
 - Browser mic STT defaults to local `faster-whisper` with `base.en`.
 - `whisper.cpp` is now selectable, but it requires local `whisper-cli`, a local
   GGML model file, and local `ffmpeg` for browser-recorded audio conversion.
@@ -101,6 +109,13 @@ Last updated: 2026-06-09
 - Browser chat turns now send the selected UI subject over the WebSocket. The
   backend treats that subject as authoritative for specialist routing and RAG
   filtering; sticky text routing is only used when no UI subject is provided.
+- Math turns also send the selected course and source mode. Retrieval filters
+  by subject plus active course, and optionally source role for Textbook or
+  Workbook mode. This keeps future Algebra II workbook and Precalculus sources
+  from mixing unless the user changes the active study set.
+- Library uploads now store `course`, `source_role`, and `topic_tags` metadata.
+  The Study Library upload UI asks for course and asset type when the subject is
+  Math.
 - Built-in RAG discovery uses the project-root `assets/` path, not the process
   working directory, so web-server startup from `src/` still finds the seeded
   PDFs.
@@ -134,7 +149,8 @@ Last updated: 2026-06-09
 - Download or place Piper voices under `models/piper/`.
 - If using `whisper.cpp`, install/place `whisper-cli`, a local GGML Whisper
   model under `models/stt/whisper.cpp/`, and ensure `ffmpeg` is installed.
-- Fix `builtin_sources` in `/api/status`: chunk counts show the built-in
-  `assets/` sources are indexed, but the source-list payload is currently empty.
 - Manual audio check: ask one short question and confirm only one sentence/voice
   is audible at a time.
+- When adding new math assets, tag Algebra II workbook as
+  `course=algebra_ii`, `source_role=workbook`; tag Precalculus textbook as
+  `course=precalculus`, `source_role=textbook`.

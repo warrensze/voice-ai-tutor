@@ -9,6 +9,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 import threading
 import time
+from pathlib import Path
 
 try:
     import msvcrt
@@ -39,7 +40,12 @@ try:
 except ImportError:  # pragma: no cover - compatibility for lightweight test stubs
     def stop_all_tts(*, except_instance=None, wait: bool = False):
         return None
-from vector import search_documents
+from vector import (
+    course_label,
+    infer_course_from_filename,
+    infer_source_role_from_filename,
+    search_documents,
+)
 from voice_config import load_subject_voice_map
 from persistence import TutorPersistence
 from note_taker_agent import QuestionNoteTakerAgent
@@ -195,6 +201,13 @@ class VoiceAgent:
         subject = str(payload.get("subject") or route_subject(question))
         if subject not in self.memories:
             subject = "english"
+        course = str(payload.get("course") or self.settings.current_course or "").strip()
+        source_mode = str(
+            payload.get("source_mode") or self.settings.rag_source_mode or "auto"
+        ).strip()
+        if subject != "math":
+            course = ""
+            source_mode = "auto"
 
         start_page, end_page = extract_page_range(question)
         retrieval_error = ""
@@ -202,6 +215,8 @@ class VoiceAgent:
             source_documents = search_documents(
                 question,
                 subject=subject,
+                course=course,
+                source_mode=source_mode,
                 start_page=start_page,
                 end_page=end_page,
                 k=5,
@@ -219,6 +234,10 @@ class VoiceAgent:
 
         # Log which filters were applied
         filter_info = f"subject={subject}"
+        if course:
+            filter_info += f", course={course}"
+        if source_mode and source_mode != "auto":
+            filter_info += f", source_mode={source_mode}"
         if start_page is not None or end_page is not None:
             page_desc = describe_page_range(start_page, end_page)
             filter_info += f", {page_desc.lower()}"
@@ -231,9 +250,27 @@ class VoiceAgent:
             "source": source,
             "source_cards": self._source_cards(source_documents),
             "page_range": describe_page_range(start_page, end_page),
+            "study_context": self._study_context(subject, course, source_mode),
             "memory_context": self._memory_context(subject),
             "retrieval_error": retrieval_error,
         }
+
+    def _study_context(self, subject: str, course: str, source_mode: str) -> str:
+        if subject != "math" or not course:
+            return "No course-specific study set is active."
+        labels = {
+            "algebra_ii": "Algebra II",
+            "precalculus": "Precalculus",
+        }
+        mode_labels = {
+            "auto": "Auto source selection",
+            "textbook": "Textbook only",
+            "workbook": "Workbook only",
+            "all": "All course sources",
+        }
+        course_label = labels.get(course, course.replace("_", " ").title())
+        mode_label = mode_labels.get(source_mode, "Auto source selection")
+        return f"Active study set: Math / {course_label} / {mode_label}."
 
     def _source_cards(self, source_documents) -> list[dict[str, str]]:
         """Return compact source metadata for the web UI."""
@@ -241,10 +278,21 @@ class VoiceAgent:
         for doc in source_documents or []:
             metadata = doc.metadata or {}
             snippet = " ".join(str(doc.page_content or "").split())[:220]
+            source_file = str(metadata.get("source_file") or "unknown")
+            subject = str(metadata.get("subject") or "unknown")
+            course = str(metadata.get("course") or "")
+            if not course:
+                course = infer_course_from_filename(Path(source_file), subject)
+            role = str(metadata.get("source_role") or "")
+            if not role:
+                role = infer_source_role_from_filename(Path(source_file))
             cards.append(
                 {
-                    "source_file": str(metadata.get("source_file") or "unknown"),
-                    "subject": str(metadata.get("subject") or "unknown"),
+                    "source_file": source_file,
+                    "subject": subject,
+                    "course": course,
+                    "course_label": str(metadata.get("course_label") or course_label(course)),
+                    "source_role": role,
                     "page_label": str(metadata.get("page_label") or ""),
                     "title": str(metadata.get("title") or ""),
                     "snippet": snippet,
@@ -440,6 +488,8 @@ class VoiceAgent:
         user_input: str,
         *,
         subject: str | None = None,
+        course: str | None = None,
+        source_mode: str | None = None,
         speak: bool = True,
         stop_event: threading.Event | None = None,
         timeout_seconds: float | None = None,
@@ -489,7 +539,12 @@ class VoiceAgent:
                 print(f"[Persistence] Failed to update current subject: {error}")
 
             chain_inputs = self.source_orchestrator.invoke(
-                {"question": user_input, "subject": turn_subject}
+                {
+                    "question": user_input,
+                    "subject": turn_subject,
+                    "course": course,
+                    "source_mode": source_mode,
+                }
             )
             active_subject = str(chain_inputs.get("subject") or "english")
             specialist_chain = self.specialist_chains.get(

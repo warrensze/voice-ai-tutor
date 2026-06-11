@@ -17,6 +17,8 @@ class TestSettingsStore(unittest.TestCase):
             self.assertEqual(loaded.llm_provider, "ollama")
             self.assertEqual(loaded.tts_backend, "kokoro")
             self.assertEqual(loaded.stt_provider, "faster-whisper")
+            self.assertEqual(loaded.current_course, "algebra_ii")
+            self.assertEqual(loaded.rag_source_mode, "auto")
 
             updated = update_user_settings({"llm_provider": "llamacpp"}, path)
             self.assertEqual(updated.llm_provider, "llamacpp")
@@ -31,6 +33,8 @@ class TestSettingsStore(unittest.TestCase):
                 "tts_backend": "remote-voice",
                 "stt_provider": "cloud-stt",
                 "current_subject": "astronomy",
+                "current_course": "algebra 2",
+                "rag_source_mode": "space-dust",
                 "kokoro_device": "quantum",
                 "faster_whisper_device": "neural",
             }
@@ -40,6 +44,8 @@ class TestSettingsStore(unittest.TestCase):
         self.assertEqual(settings.tts_backend, "piper")
         self.assertEqual(settings.stt_provider, "faster-whisper")
         self.assertEqual(settings.current_subject, "english")
+        self.assertEqual(settings.current_course, "algebra_ii")
+        self.assertEqual(settings.rag_source_mode, "auto")
         self.assertEqual(settings.kokoro_device, "auto")
         self.assertEqual(settings.faster_whisper_device, "auto")
 

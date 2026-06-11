@@ -20,7 +20,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import chromadb
 from local_providers import create_embedding_model
-from settings_store import PROJECT_ROOT, UserSettings, load_user_settings
+from settings_store import (
+    PROJECT_ROOT,
+    RAG_SOURCE_MODES,
+    SOURCE_ROLES,
+    UserSettings,
+    load_user_settings,
+)
 
 # Data locations
 ASSETS_DIR = PROJECT_ROOT / "assets"
@@ -33,6 +39,14 @@ EMBED_CHUNK_SIZE = 500
 EMBED_CHUNK_OVERLAP = 100
 UPSERT_BATCH_SIZE = 1000
 OCR_TEXT_SUFFIX = ".ocr.txt"
+DEFAULT_MATH_COURSE = "algebra_ii"
+DEFAULT_SOURCE_ROLE = "textbook"
+
+COURSE_SOURCE_FILE_ALIASES = {
+    ("math", "algebra_ii"): (
+        {"source_file": "Algebra-2-Book.pdf", "source_role": "textbook"},
+    ),
+}
 
 SUBJECT_PDF_PATTERNS = {
     "history": ["*history*.pdf", "*world*.pdf"],
@@ -56,6 +70,82 @@ def _safe_key(value: str) -> str:
 
 def _settings_or_default(settings: UserSettings | None = None) -> UserSettings:
     return settings if settings is not None else load_user_settings()
+
+
+def clean_course(value: str | None, *, subject: str | None = "math") -> str:
+    cleaned = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "algebra_2": "algebra_ii",
+        "algebra_ii": "algebra_ii",
+        "alg_2": "algebra_ii",
+        "alg_ii": "algebra_ii",
+        "pre_calc": "precalculus",
+        "precalculus": "precalculus",
+        "pre_calculus": "precalculus",
+    }
+    cleaned = aliases.get(cleaned, cleaned)
+    if subject == "math" and cleaned in {"algebra_ii", "precalculus"}:
+        return cleaned
+    return ""
+
+
+def clean_source_role(value: str | None, default: str = DEFAULT_SOURCE_ROLE) -> str:
+    cleaned = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "core": "textbook",
+        "book": "textbook",
+        "text": "textbook",
+        "practice": "workbook",
+        "practice_book": "workbook",
+        "exercise": "workbook",
+        "exercises": "workbook",
+        "test": "exam",
+    }
+    cleaned = aliases.get(cleaned, cleaned)
+    return cleaned if cleaned in SOURCE_ROLES else default
+
+
+def clean_source_mode(value: str | None) -> str:
+    cleaned = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return cleaned if cleaned in RAG_SOURCE_MODES else "auto"
+
+
+def infer_course_from_filename(file_path: Path, subject: str) -> str:
+    filename = file_path.name.lower()
+    if subject != "math":
+        return ""
+    if any(token in filename for token in ("precalc", "pre-calc", "pre_cal", "precalculus")):
+        return "precalculus"
+    if any(token in filename for token in ("algebra-2", "algebra_2", "algebra 2", "algebra-ii", "algebra_ii", "algebra ii")):
+        return "algebra_ii"
+    return DEFAULT_MATH_COURSE
+
+
+def infer_source_role_from_filename(file_path: Path) -> str:
+    filename = file_path.name.lower()
+    if any(token in filename for token in ("exam", "test", "assessment")):
+        return "exam"
+    if any(token in filename for token in ("workbook", "practice", "exercise")):
+        return "workbook"
+    if any(token in filename for token in ("formula", "reference", "table")):
+        return "reference"
+    if any(token in filename for token in ("note", "notes")):
+        return "notes"
+    return DEFAULT_SOURCE_ROLE
+
+
+def source_role_label(value: str | None) -> str:
+    role = clean_source_role(value, default="other")
+    return role.replace("_", " ")
+
+
+def course_label(value: str | None) -> str:
+    course = clean_course(value)
+    labels = {
+        "algebra_ii": "Algebra II",
+        "precalculus": "Precalculus",
+    }
+    return labels.get(course, "")
 
 
 def embedding_model_name(settings: UserSettings | None = None) -> str:
@@ -153,7 +243,12 @@ def get_ocr_text_path(pdf_path: Path) -> Path:
 
 
 def build_ingest_key(
-    subject: str, pdf_path: Path, ocr_text_path: Path | None = None
+    subject: str,
+    pdf_path: Path,
+    ocr_text_path: Path | None = None,
+    *,
+    course: str = "",
+    source_role: str = "",
 ) -> str:
     """Build a stable ingestion key so each file version is indexed once."""
     stats = pdf_path.stat()
@@ -179,6 +274,9 @@ def load_and_split_pdf(
     subject: str,
     source_file: str,
     ingest_key: str,
+    course: str = "",
+    source_role: str = DEFAULT_SOURCE_ROLE,
+    title: str = "",
 ) -> list[Document]:
     """Load a PDF and split it into chunks with subject metadata."""
     loader = PyPDFLoader(pdf_path)
@@ -199,6 +297,10 @@ def load_and_split_pdf(
         for chunk in chunks:
             metadata = {**page.metadata}
             metadata["subject"] = subject
+            metadata["course"] = course
+            metadata["course_label"] = course_label(course)
+            metadata["source_role"] = source_role
+            metadata["title"] = title or Path(source_file).stem
             metadata["source_file"] = source_file
             metadata["ingest_key"] = ingest_key
             # Always use page_idx (0-based) directly for proper filtering
@@ -217,6 +319,9 @@ def load_and_split_ocr_text(
     subject: str,
     source_file: str,
     ingest_key: str,
+    course: str = "",
+    source_role: str = DEFAULT_SOURCE_ROLE,
+    title: str = "",
 ) -> list[Document]:
     """Load OCR text sidecar output and split it into vector chunks."""
     raw_text = text_path.read_text(encoding="utf-8", errors="ignore")
@@ -242,6 +347,10 @@ def load_and_split_ocr_text(
                     page_content=chunk,
                     metadata={
                         "subject": subject,
+                        "course": course,
+                        "course_label": course_label(course),
+                        "source_role": source_role,
+                        "title": title or Path(source_file).stem,
                         "source_file": source_file,
                         "ingest_key": ingest_key,
                         "ocr_text_file": text_path.name,
@@ -264,6 +373,10 @@ def load_and_split_ocr_text(
                     page_content=chunk,
                     metadata={
                         "subject": subject,
+                        "course": course,
+                        "course_label": course_label(course),
+                        "source_role": source_role,
+                        "title": title or Path(source_file).stem,
                         "source_file": source_file,
                         "ingest_key": ingest_key,
                         "ocr_text_file": text_path.name,
@@ -319,17 +432,79 @@ def build_subject_filter(subject: str | None = None):
     return {"subject": {"$eq": cleaned}}
 
 
-def combine_filters(page_filter, subject_filter):
-    """Combine page and subject filters into one filter expression."""
-    if page_filter and subject_filter:
-        clauses = []
-        if isinstance(page_filter, dict) and set(page_filter.keys()) == {"$and"}:
-            clauses.extend(page_filter["$and"])
-        else:
-            clauses.append(page_filter)
-        clauses.append(subject_filter)
-        return {"$and": clauses}
-    return page_filter or subject_filter
+def _as_and_clauses(filter_spec) -> list[dict]:
+    if not filter_spec:
+        return []
+    if isinstance(filter_spec, dict) and set(filter_spec.keys()) == {"$and"}:
+        return list(filter_spec["$and"])
+    return [filter_spec]
+
+
+def _or_filters(filters: list[dict]):
+    cleaned = [item for item in filters if item]
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return {"$or": cleaned}
+
+
+def combine_filters(page_filter, subject_filter, study_filter=None):
+    """Combine page, subject, and study-set filters into one expression."""
+    clauses = []
+    clauses.extend(_as_and_clauses(page_filter))
+    clauses.extend(_as_and_clauses(subject_filter))
+    clauses.extend(_as_and_clauses(study_filter))
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def build_study_filter(
+    *,
+    subject: str | None = None,
+    course: str | None = None,
+    source_mode: str | None = None,
+):
+    """Build optional course/source-role filters for focused study sets."""
+    cleaned_subject = str(subject or "").strip().lower()
+    cleaned_course = clean_course(course, subject=cleaned_subject)
+    cleaned_mode = clean_source_mode(source_mode)
+    role = cleaned_mode if cleaned_mode in {"textbook", "workbook"} else ""
+
+    clauses = []
+    aliases = list(COURSE_SOURCE_FILE_ALIASES.get((cleaned_subject, cleaned_course), ()))
+
+    if cleaned_course:
+        course_alias_filters = [
+            {"source_file": {"$eq": item["source_file"]}}
+            for item in aliases
+        ]
+        clauses.append(
+            _or_filters(
+                [{"course": {"$eq": cleaned_course}}, *course_alias_filters]
+            )
+        )
+
+    if role:
+        role_alias_filters = [
+            {"source_file": {"$eq": item["source_file"]}}
+            for item in aliases
+            if item.get("source_role") == role
+        ]
+        clauses.append(
+            _or_filters(
+                [{"source_role": {"$eq": role}}, *role_alias_filters]
+            )
+        )
+
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def ingest_subject_documents(
@@ -346,10 +521,14 @@ def ingest_subject_documents(
 
     for subject, pdf_path in subject_pdfs:
         ocr_text_path = get_ocr_text_path(pdf_path)
+        course = infer_course_from_filename(pdf_path, subject)
+        source_role = infer_source_role_from_filename(pdf_path)
         ingest_key = build_ingest_key(
             subject,
             pdf_path,
             ocr_text_path if ocr_text_path.exists() else None,
+            course=course,
+            source_role=source_role,
         )
         if ingest_key_exists(vector_store, ingest_key):
             continue
@@ -359,6 +538,9 @@ def ingest_subject_documents(
             subject=subject,
             source_file=pdf_path.name,
             ingest_key=ingest_key,
+            course=course,
+            source_role=source_role,
+            title=pdf_path.stem,
         )
         if not chunks:
             if ocr_text_path.exists():
@@ -367,6 +549,9 @@ def ingest_subject_documents(
                     subject=subject,
                     source_file=pdf_path.name,
                     ingest_key=ingest_key,
+                    course=course,
+                    source_role=source_role,
+                    title=pdf_path.stem,
                 )
                 if chunks:
                     print(
@@ -469,6 +654,8 @@ def search_documents(
     query: str,
     *,
     subject: str | None = None,
+    course: str | None = None,
+    source_mode: str | None = None,
     start_page: int | None = None,
     end_page: int | None = None,
     k: int = 5,
@@ -479,6 +666,8 @@ def search_documents(
     Args:
         query: Search query text
         subject: Optional subject filter ('history', 'chemistry', 'math', 'english')
+        course: Optional course filter for subjects with multiple study sets
+        source_mode: Optional source scope ('auto', 'textbook', 'workbook', 'all')
         start_page: Optional start page (1-based, inclusive)
         end_page: Optional end page (1-based, inclusive)
         k: Number of results to return
@@ -492,7 +681,12 @@ def search_documents(
     # Build filters
     page_filter = build_page_filter(start_page, end_page)
     subject_filter = build_subject_filter(subject)
-    combined_filter = combine_filters(page_filter, subject_filter)
+    study_filter = build_study_filter(
+        subject=subject,
+        course=course,
+        source_mode=source_mode,
+    )
+    combined_filter = combine_filters(page_filter, subject_filter, study_filter)
 
     # Track whether page filter was requested for fallback strategy
     page_filter_requested = start_page is not None or end_page is not None
@@ -514,8 +708,16 @@ def search_documents(
         page_label = doc.metadata.get("page_label", "unknown")
         page_num = doc.metadata.get("page", "unknown")
         subject_result = doc.metadata.get("subject", "unknown")
+        course_result = doc.metadata.get("course") or infer_course_from_filename(
+            Path(str(doc.metadata.get("source_file") or "")),
+            str(subject_result),
+        )
+        role_result = doc.metadata.get("source_role") or infer_source_role_from_filename(
+            Path(str(doc.metadata.get("source_file") or ""))
+        )
         print(
-            f"[Vector]   Result {i}: page_label={page_label} (page={page_num}), subject={subject_result}"
+            f"[Vector]   Result {i}: page_label={page_label} (page={page_num}), "
+            f"subject={subject_result}, course={course_result}, role={role_result}"
         )
 
     # Step 2: Fallback strategy - if page filter was requested but returned no results,
@@ -526,8 +728,9 @@ def search_documents(
             f"Retrying with page filter and higher k={k * 3}..."
         )
         retry_kwargs = {"k": k * 3}
-        if page_filter is not None:
-            retry_kwargs["filter"] = page_filter
+        retry_filter = combine_filters(page_filter, subject_filter, study_filter)
+        if retry_filter is not None:
+            retry_kwargs["filter"] = retry_filter
         results = active_store.similarity_search(query, **retry_kwargs)
 
         print(f"[Vector] Retry found {len(results)} results with page filter")
@@ -547,8 +750,9 @@ def search_documents(
                 f"Expanding search to all pages to find relevant content..."
             )
             expand_kwargs = {"k": k}
-            if subject_filter is not None:
-                expand_kwargs["filter"] = subject_filter
+            expand_filter = combine_filters(None, subject_filter, study_filter)
+            if expand_filter is not None:
+                expand_kwargs["filter"] = expand_filter
             results = active_store.similarity_search(query, **expand_kwargs)
 
             print(
@@ -613,6 +817,8 @@ def _validate_filter_applied(results, filter_spec, subject, start_page, end_page
 def get_retriever(
     k: int = 5,
     subject: str | None = None,
+    course: str | None = None,
+    source_mode: str | None = None,
     start_page: int | None = None,
     end_page: int | None = None,
     settings: UserSettings | None = None,
@@ -634,7 +840,12 @@ def get_retriever(
     # Build filters
     page_filter = build_page_filter(start_page, end_page)
     subject_filter = build_subject_filter(subject)
-    combined_filter = combine_filters(page_filter, subject_filter)
+    study_filter = build_study_filter(
+        subject=subject,
+        course=course,
+        source_mode=source_mode,
+    )
+    combined_filter = combine_filters(page_filter, subject_filter, study_filter)
 
     search_kwargs = {"k": k}
     if combined_filter is not None:
@@ -684,6 +895,9 @@ def get_ingestion_summary(
     discovered_files = [
         {
             "subject": subject,
+            "course": infer_course_from_filename(path, subject),
+            "course_label": course_label(infer_course_from_filename(path, subject)),
+            "source_role": infer_source_role_from_filename(path),
             "source_file": path.name,
             "source_path": str(path),
             "title": path.stem,
@@ -699,12 +913,19 @@ def get_ingestion_summary(
     metadatas = rows.get("metadatas") or []
     ids = rows.get("ids") or []
     summary: dict[str, dict] = {}
+    courses: dict[str, dict] = {}
     indexed_source_files: set[str] = set()
 
     for metadata in metadatas:
         record = metadata or {}
         subject = str(record.get("subject") or "unknown")
         source_file = str(record.get("source_file") or "unknown")
+        course = str(record.get("course") or "").strip()
+        if not course:
+            course = infer_course_from_filename(Path(source_file), subject)
+        source_role = str(record.get("source_role") or "").strip()
+        if not source_role:
+            source_role = infer_source_role_from_filename(Path(source_file))
         if source_file != "unknown":
             indexed_source_files.add(source_file)
 
@@ -712,6 +933,21 @@ def get_ingestion_summary(
         subject_bucket["chunks"] += 1
         file_counts = subject_bucket["files"]
         file_counts[source_file] = file_counts.get(source_file, 0) + 1
+        if course:
+            course_key = f"{subject}:{course}"
+            course_bucket = courses.setdefault(
+                course_key,
+                {
+                    "subject": subject,
+                    "course": course,
+                    "course_label": course_label(course),
+                    "chunks": 0,
+                    "roles": {},
+                },
+            )
+            course_bucket["chunks"] += 1
+            roles = course_bucket["roles"]
+            roles[source_role] = roles.get(source_role, 0) + 1
 
     pending_files = [
         file_info
@@ -745,6 +981,7 @@ def get_ingestion_summary(
     return {
         "total_chunks": len(ids) or len(metadatas),
         "subjects": summary,
+        "courses": list(courses.values()),
         "discovered_files": discovered_files,
         "pending_files": pending_files,
         "builtin_sources": builtin_sources,

@@ -68,3 +68,9 @@
 - Asked why the laptop was getting hot; sampled local processes and found iOS
   Simulator/Xcode services, `WindowServer`, and VS Code GPU/renderer using more
   CPU than the idle tutor services at that moment.
+
+2026-06-11
+
+- Asked to plan and then proceed with a scalable Math design for multiple
+  textbooks/workbooks. Implemented Math study sets with active course/source
+  mode, course/source-role metadata for uploads, and filtered RAG retrieval.

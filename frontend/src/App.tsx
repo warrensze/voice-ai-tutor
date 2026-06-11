@@ -24,6 +24,8 @@ type TutorSettings = {
   tts_backend: "piper" | "kokoro" | "pyttsx3";
   stt_provider: "faster-whisper" | "whispercpp";
   current_subject: Subject;
+  current_course: StudyCourse;
+  rag_source_mode: RagSourceMode;
   speak_responses: boolean;
   ollama_base_url: string;
   ollama_chat_model: string;
@@ -49,6 +51,9 @@ type TutorSettings = {
 };
 
 type Subject = "english" | "history" | "chemistry" | "math";
+type StudyCourse = "algebra_ii" | "precalculus";
+type RagSourceMode = "auto" | "textbook" | "workbook" | "all";
+type SourceRole = "textbook" | "workbook" | "notes" | "exam" | "reference" | "other";
 
 type Message = {
   id: string;
@@ -60,6 +65,9 @@ type Message = {
 type SourceCard = {
   source_file: string;
   subject: string;
+  course: string;
+  course_label: string;
+  source_role: string;
   page_label: string;
   title: string;
   snippet: string;
@@ -69,6 +77,8 @@ type LibraryAsset = {
   id: string;
   title: string;
   subject: Subject;
+  course: StudyCourse | "";
+  source_role: SourceRole;
   source_file: string;
   file_type: string;
   status: string;
@@ -80,6 +90,9 @@ type LibraryAsset = {
 type BuiltInSource = {
   title: string;
   subject: Subject;
+  course: StudyCourse | "";
+  course_label: string;
+  source_role: SourceRole;
   source_file: string;
   file_type: string;
   status: string;
@@ -140,6 +153,27 @@ type VoiceOption = {
 };
 
 const subjects: Subject[] = ["english", "history", "chemistry", "math"];
+const mathCourses: StudyCourse[] = ["algebra_ii", "precalculus"];
+const ragSourceModes: RagSourceMode[] = ["auto", "textbook", "workbook", "all"];
+const sourceRoles: SourceRole[] = ["textbook", "workbook", "notes", "exam", "reference", "other"];
+const courseLabels: Record<StudyCourse, string> = {
+  algebra_ii: "Algebra II",
+  precalculus: "Precalculus"
+};
+const sourceModeLabels: Record<RagSourceMode, string> = {
+  auto: "Auto",
+  textbook: "Textbook",
+  workbook: "Workbook",
+  all: "All"
+};
+const sourceRoleLabels: Record<SourceRole, string> = {
+  textbook: "Textbook",
+  workbook: "Workbook",
+  notes: "Notes",
+  exam: "Exam",
+  reference: "Reference",
+  other: "Other"
+};
 
 const defaultSettings: TutorSettings = {
   llm_provider: "llamacpp",
@@ -147,6 +181,8 @@ const defaultSettings: TutorSettings = {
   tts_backend: "piper",
   stt_provider: "faster-whisper",
   current_subject: "english",
+  current_course: "algebra_ii",
+  rag_source_mode: "auto",
   speak_responses: true,
   ollama_base_url: "http://127.0.0.1:11434",
   ollama_chat_model: "llama3.1:8b",
@@ -198,6 +234,14 @@ function sttProviderLabel(provider: string) {
   return provider === "whispercpp" ? "whisper.cpp" : provider;
 }
 
+function prettyCourse(course: string) {
+  return courseLabels[course as StudyCourse] || course.replace(/_/g, " ");
+}
+
+function prettySourceRole(role: string) {
+  return sourceRoleLabels[role as SourceRole] || role.replace(/_/g, " ");
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -223,6 +267,8 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [uploadSubject, setUploadSubject] = useState<Subject>("english");
+  const [uploadCourse, setUploadCourse] = useState<StudyCourse>("algebra_ii");
+  const [uploadSourceRole, setUploadSourceRole] = useState<SourceRole>("textbook");
   const wsRef = useRef<WebSocket | null>(null);
   const turnActiveRef = useRef(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -299,6 +345,8 @@ export default function App() {
       "kokoro_allow_cpu",
       "pyttsx3_voice",
       "subject_voices",
+      "current_course",
+      "rag_source_mode",
       "stt_provider",
       "stt_language",
       "faster_whisper_model",
@@ -398,6 +446,8 @@ export default function App() {
       socket.send(JSON.stringify({
         question: trimmed,
         subject: settings.current_subject,
+        course: settings.current_subject === "math" ? settings.current_course : "",
+        source_mode: settings.current_subject === "math" ? settings.rag_source_mode : "auto",
         speak: settings.speak_responses
       }));
     };
@@ -567,6 +617,8 @@ export default function App() {
       const form = new FormData();
       form.append("file", file);
       form.append("subject", uploadSubject);
+      form.append("course", uploadSubject === "math" ? uploadCourse : "");
+      form.append("source_role", uploadSourceRole);
       form.append("title", file.name.replace(/\.[^.]+$/, ""));
       await api<LibraryAsset>("/api/library/assets", { method: "POST", body: form });
     }
@@ -625,6 +677,39 @@ export default function App() {
               </button>
             ))}
           </div>
+          {settings.current_subject === "math" && (
+            <div className="study-scope">
+              <div className="study-scope-line">
+                <span>Using</span>
+                <strong>{prettyCourse(settings.current_course)}</strong>
+                <span>{sourceModeLabels[settings.rag_source_mode]}</span>
+              </div>
+              <div className="study-controls">
+                <label>
+                  <span>Course</span>
+                  <select
+                    value={settings.current_course}
+                    onChange={(event) => saveSettings({ current_course: event.target.value as StudyCourse })}
+                  >
+                    {mathCourses.map((course) => (
+                      <option key={course} value={course}>{courseLabels[course]}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Sources</span>
+                  <select
+                    value={settings.rag_source_mode}
+                    onChange={(event) => saveSettings({ rag_source_mode: event.target.value as RagSourceMode })}
+                  >
+                    {ragSourceModes.map((mode) => (
+                      <option key={mode} value={mode}>{sourceModeLabels[mode]}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+          )}
 
           <div className="messages">
             {messages.length === 0 ? (
@@ -745,6 +830,8 @@ export default function App() {
                   </div>
                   <div className="source-meta">
                     {source.subject}
+                    {source.course_label || source.course ? ` · ${source.course_label || prettyCourse(source.course)}` : ""}
+                    {source.source_role ? ` · ${prettySourceRole(source.source_role)}` : ""}
                     {source.page_label ? ` · page ${source.page_label}` : ""}
                   </div>
                   <p>{source.snippet}</p>
@@ -861,6 +948,26 @@ export default function App() {
               {subjects.map((subject) => <option key={subject}>{subject}</option>)}
             </select>
           </div>
+          {uploadSubject === "math" && (
+            <div className="upload-grid">
+              <label className="field">
+                <span>Course</span>
+                <select value={uploadCourse} onChange={(event) => setUploadCourse(event.target.value as StudyCourse)}>
+                  {mathCourses.map((course) => (
+                    <option key={course} value={course}>{courseLabels[course]}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Asset type</span>
+                <select value={uploadSourceRole} onChange={(event) => setUploadSourceRole(event.target.value as SourceRole)}>
+                  {sourceRoles.map((role) => (
+                    <option key={role} value={role}>{sourceRoleLabels[role]}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          )}
           <div className="library-section-title">Built-in Sources</div>
           <div className="asset-list">
             {builtInSources.length === 0 ? (
@@ -876,7 +983,10 @@ export default function App() {
                   <div>
                     <div className="asset-title">{source.title || source.source_file}</div>
                     <div className="asset-meta">
-                      {source.subject} · {source.file_type} · {source.status} · {source.chunk_count} chunks
+                      {source.subject}
+                      {source.course ? ` · ${source.course_label || prettyCourse(source.course)}` : ""}
+                      {source.source_role ? ` · ${prettySourceRole(source.source_role)}` : ""}
+                      {` · ${source.file_type} · ${source.status} · ${source.chunk_count} chunks`}
                       {source.has_ocr_text ? " · OCR sidecar" : ""}
                     </div>
                   </div>
@@ -900,7 +1010,12 @@ export default function App() {
               <div className="asset" key={asset.id}>
                 <div>
                   <div className="asset-title">{asset.title}</div>
-                  <div className="asset-meta">{asset.subject} · {asset.file_type} · {asset.status} · {asset.chunk_count} chunks</div>
+                  <div className="asset-meta">
+                    {asset.subject}
+                    {asset.course ? ` · ${prettyCourse(asset.course)}` : ""}
+                    {asset.source_role ? ` · ${prettySourceRole(asset.source_role)}` : ""}
+                    {` · ${asset.file_type} · ${asset.status} · ${asset.chunk_count} chunks`}
+                  </div>
                   {asset.error && <div className="asset-error">{asset.error}</div>}
                 </div>
                 <div className="asset-actions">

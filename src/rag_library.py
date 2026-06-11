@@ -16,6 +16,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from settings_store import DATA_DIR, SUPPORTED_SUBJECTS, UserSettings, load_user_settings
+from vector import clean_course, clean_source_role, course_label
 from vector import (
     EMBED_CHUNK_OVERLAP,
     EMBED_CHUNK_SIZE,
@@ -55,6 +56,43 @@ def _infer_subject(filename: str) -> str:
         if any(token in lower for token in tokens):
             return subject
     return "english"
+
+
+def _infer_course(filename: str, subject: str) -> str:
+    lower = filename.lower()
+    if subject != "math":
+        return ""
+    if any(token in lower for token in ("precalc", "pre-calc", "pre_cal", "precalculus")):
+        return "precalculus"
+    if any(token in lower for token in ("algebra-2", "algebra_2", "algebra 2", "algebra-ii", "algebra_ii", "algebra ii")):
+        return "algebra_ii"
+    return "algebra_ii"
+
+
+def _infer_source_role(filename: str) -> str:
+    lower = filename.lower()
+    if any(token in lower for token in ("exam", "test", "assessment")):
+        return "exam"
+    if any(token in lower for token in ("workbook", "practice", "exercise")):
+        return "workbook"
+    if any(token in lower for token in ("formula", "reference", "table")):
+        return "reference"
+    if any(token in lower for token in ("note", "notes")):
+        return "notes"
+    return "textbook"
+
+
+def _clean_topic_tags(value: Any) -> str:
+    if isinstance(value, list):
+        parts = value
+    else:
+        parts = str(value or "").split(",")
+    cleaned = []
+    for item in parts:
+        tag = re.sub(r"\s+", " ", str(item or "").strip().lower())
+        if tag and tag not in cleaned:
+            cleaned.append(tag)
+    return ", ".join(cleaned)
 
 
 def _file_sha256(path: Path) -> str:
@@ -99,6 +137,9 @@ class LibraryManager:
         subject: str | None = None,
         title: str | None = None,
         notes: str = "",
+        course: str | None = None,
+        source_role: str | None = None,
+        topic_tags: Any = "",
     ) -> dict[str, Any]:
         source = Path(source_path)
         filename = original_filename or source.name
@@ -116,11 +157,23 @@ class LibraryManager:
         safe_name = _safe_filename(filename)
         destination = self.library_dir / f"{asset_id}_{safe_name}"
         shutil.copy2(source, destination)
+        cleaned_subject = _clean_subject(subject) if subject else _infer_subject(filename)
+        cleaned_course = clean_course(
+            course or _infer_course(filename, cleaned_subject),
+            subject=cleaned_subject,
+        )
+        cleaned_role = clean_source_role(
+            source_role or _infer_source_role(filename),
+            default="textbook",
+        )
 
         asset = {
             "id": asset_id,
             "title": title.strip() if title else Path(filename).stem,
-            "subject": _clean_subject(subject) if subject else _infer_subject(filename),
+            "subject": cleaned_subject,
+            "course": cleaned_course,
+            "source_role": cleaned_role,
+            "topic_tags": _clean_topic_tags(topic_tags),
             "notes": notes.strip(),
             "source_path": str(destination),
             "source_file": filename,
@@ -146,6 +199,23 @@ class LibraryManager:
                 asset[key] = str(updates.get(key) or "").strip()
         if "subject" in updates:
             asset["subject"] = _clean_subject(str(updates.get("subject") or ""))
+            asset["status"] = "queued"
+            if asset["subject"] != "math":
+                asset["course"] = ""
+        if "course" in updates:
+            asset["course"] = clean_course(
+                str(updates.get("course") or ""),
+                subject=str(asset.get("subject") or ""),
+            )
+            asset["status"] = "queued"
+        if "source_role" in updates:
+            asset["source_role"] = clean_source_role(
+                str(updates.get("source_role") or ""),
+                default=str(asset.get("source_role") or "textbook"),
+            )
+            asset["status"] = "queued"
+        if "topic_tags" in updates:
+            asset["topic_tags"] = _clean_topic_tags(updates.get("topic_tags"))
             asset["status"] = "queued"
         asset["updated_at"] = _utc_now_iso()
         self._upsert_asset(asset)
@@ -345,6 +415,10 @@ class LibraryManager:
             "asset_id": asset["id"],
             "library_asset": True,
             "subject": asset["subject"],
+            "course": str(asset.get("course") or ""),
+            "course_label": course_label(str(asset.get("course") or "")),
+            "source_role": str(asset.get("source_role") or "textbook"),
+            "topic_tags": str(asset.get("topic_tags") or ""),
             "title": asset["title"],
             "source_file": asset["source_file"],
             "source_path": asset["source_path"],
@@ -357,6 +431,23 @@ class LibraryManager:
         if page_label is not None:
             metadata["page_label"] = page_label
         return metadata
+
+    def _normalize_asset(self, asset: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(asset)
+        subject = _clean_subject(str(normalized.get("subject") or ""))
+        normalized["subject"] = subject
+        normalized["course"] = clean_course(
+            str(normalized.get("course") or _infer_course(str(normalized.get("source_file") or ""), subject)),
+            subject=subject,
+        )
+        if subject != "math":
+            normalized["course"] = ""
+        normalized["source_role"] = clean_source_role(
+            str(normalized.get("source_role") or _infer_source_role(str(normalized.get("source_file") or ""))),
+            default="textbook",
+        )
+        normalized["topic_tags"] = _clean_topic_tags(normalized.get("topic_tags"))
+        return normalized
 
     def _splitter(self) -> RecursiveCharacterTextSplitter:
         return RecursiveCharacterTextSplitter(
@@ -379,6 +470,11 @@ class LibraryManager:
             payload = {"version": 1, "updated_at": _utc_now_iso(), "assets": []}
         if not isinstance(payload.get("assets"), list):
             payload["assets"] = []
+        payload["assets"] = [
+            self._normalize_asset(asset)
+            for asset in payload["assets"]
+            if isinstance(asset, dict)
+        ]
         return payload
 
     def _write_index(self, payload: dict[str, Any]) -> None:

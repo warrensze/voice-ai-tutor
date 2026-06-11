@@ -14,6 +14,14 @@ TTS_BACKENDS = ("piper", "kokoro", "pyttsx3")
 KOKORO_DEVICES = ("auto", "cpu", "cuda")
 STT_PROVIDERS = ("faster-whisper", "whispercpp")
 STT_DEVICES = ("auto", "cpu", "cuda")
+RAG_SOURCE_MODES = ("auto", "textbook", "workbook", "all")
+SOURCE_ROLES = ("textbook", "workbook", "notes", "exam", "reference", "other")
+STUDY_COURSES = {
+    "math": (
+        {"id": "algebra_ii", "label": "Algebra II"},
+        {"id": "precalculus", "label": "Precalculus"},
+    )
+}
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -45,6 +53,22 @@ def _clean_subject(value: Any, default: str = "english") -> str:
     return _clean_choice(value, SUPPORTED_SUBJECTS, default)
 
 
+def _clean_course(value: Any, subject: str = "math", default: str = "algebra_ii") -> str:
+    cleaned = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "algebra_2": "algebra_ii",
+        "algebra_ii": "algebra_ii",
+        "alg_2": "algebra_ii",
+        "alg_ii": "algebra_ii",
+        "pre_calc": "precalculus",
+        "precalculus": "precalculus",
+        "pre_calculus": "precalculus",
+    }
+    cleaned = aliases.get(cleaned, cleaned)
+    allowed = {str(course["id"]) for course in STUDY_COURSES.get(subject, ())}
+    return cleaned if cleaned in allowed else default
+
+
 def _clean_float(value: Any, default: float) -> float:
     try:
         return float(value)
@@ -61,6 +85,8 @@ class UserSettings:
     tts_backend: str = "piper"
     stt_provider: str = "faster-whisper"
     current_subject: str = "english"
+    current_course: str = "algebra_ii"
+    rag_source_mode: str = "auto"
     speak_responses: bool = True
 
     ollama_base_url: str = "http://127.0.0.1:11434"
@@ -141,6 +167,10 @@ class UserSettings:
             settings.stt_provider, defaults.stt_provider
         )
         settings.current_subject = _clean_subject(settings.current_subject)
+        settings.current_course = _clean_course(settings.current_course, "math")
+        settings.rag_source_mode = _clean_choice(
+            settings.rag_source_mode, RAG_SOURCE_MODES, defaults.rag_source_mode
+        )
         if settings.llamacpp_chat_model == "local-model":
             settings.llamacpp_chat_model = defaults.llamacpp_chat_model
         if settings.llamacpp_embedding_model == "local-embed":
@@ -210,6 +240,14 @@ class UserSettings:
         settings.stt_provider = _clean_stt_provider(
             os.getenv("STT_PROVIDER"), settings.stt_provider
         )
+        settings.current_course = _clean_course(
+            os.getenv("CURRENT_COURSE", settings.current_course), "math"
+        )
+        settings.rag_source_mode = _clean_choice(
+            os.getenv("RAG_SOURCE_MODE"),
+            RAG_SOURCE_MODES,
+            settings.rag_source_mode,
+        )
         settings.ollama_chat_model = os.getenv(
             "OLLAMA_CHAT_MODEL", settings.ollama_chat_model
         )
@@ -272,6 +310,8 @@ class UserSettings:
                 self.embedding_provider,
                 self.tts_backend,
                 self.stt_provider,
+                self.current_course,
+                self.rag_source_mode,
                 self.ollama_chat_model,
                 self.ollama_embedding_model,
                 self.llamacpp_chat_base_url,
@@ -375,4 +415,9 @@ def settings_status_payload(settings: UserSettings) -> dict[str, Any]:
         "llm_providers": list(LLM_PROVIDERS),
         "tts_backends": list(TTS_BACKENDS),
         "stt_providers": list(STT_PROVIDERS),
+        "study_courses": {
+            subject: list(courses) for subject, courses in STUDY_COURSES.items()
+        },
+        "rag_source_modes": list(RAG_SOURCE_MODES),
+        "source_roles": list(SOURCE_ROLES),
     }

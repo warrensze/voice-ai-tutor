@@ -21,17 +21,33 @@ class TestLibraryManager(unittest.TestCase):
                 index_path=root / "library" / "library_index.json",
             )
 
-            asset = manager.add_asset(source, subject="math", title="Algebra Notes")
+            asset = manager.add_asset(
+                source,
+                subject="math",
+                title="Algebra Notes",
+                course="algebra_ii",
+                source_role="workbook",
+                topic_tags="quadratics, factoring",
+            )
             duplicate = manager.add_asset(source, subject="math", title="Duplicate")
 
             self.assertFalse(asset["duplicate"])
+            self.assertEqual(asset["course"], "algebra_ii")
+            self.assertEqual(asset["source_role"], "workbook")
+            self.assertEqual(asset["topic_tags"], "quadratics, factoring")
             self.assertTrue(duplicate["duplicate"])
             self.assertEqual(duplicate["id"], asset["id"])
+
+            captured_documents = []
+
+            def fake_index(docs, settings=None):
+                captured_documents.extend(docs)
+                return len(docs)
 
             with (
                 patch(
                     "rag_library.index_documents",
-                    side_effect=lambda docs, settings=None: len(docs),
+                    side_effect=fake_index,
                 ) as mock_index,
                 patch("rag_library.delete_documents_for_asset") as mock_delete,
             ):
@@ -39,6 +55,14 @@ class TestLibraryManager(unittest.TestCase):
                 self.assertEqual(indexed["status"], "ready")
                 self.assertGreater(indexed["chunk_count"], 0)
                 self.assertTrue(mock_index.called)
+                self.assertEqual(
+                    captured_documents[0].metadata["course"],
+                    "algebra_ii",
+                )
+                self.assertEqual(
+                    captured_documents[0].metadata["source_role"],
+                    "workbook",
+                )
 
                 preview = manager.preview_asset(asset["id"])
                 self.assertIn("Quadratic equations", preview)

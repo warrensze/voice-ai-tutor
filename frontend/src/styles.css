@@ -144,6 +144,50 @@ button {
   border-color: #174c43;
 }
 
+.study-scope {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(31, 42, 51, 0.08);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.study-scope-line,
+.study-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.study-scope-line {
+  color: #52616c;
+  font-size: 13px;
+}
+
+.study-scope-line strong {
+  color: #172026;
+}
+
+.study-controls label {
+  display: grid;
+  gap: 5px;
+  color: #52616c;
+  font-size: 11px;
+}
+
+.study-controls select {
+  min-width: 132px;
+  min-height: 36px;
+  border: 1px solid rgba(31, 42, 51, 0.14);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: #ffffff;
+  color: #172026;
+}
+
 .messages {
   flex: 1;
   min-height: 0;
@@ -528,6 +572,12 @@ button {
   cursor: pointer;
 }
 
+.upload-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
 .asset-list {
   display: grid;
   gap: 10px;
@@ -644,6 +694,14 @@ button {
     order: -1;
     max-height: 34dvh;
     padding: 16px;
+  }
+
+  .study-scope {
+    grid-template-columns: 1fr;
+  }
+
+  .study-controls {
+    align-items: stretch;
   }
 
   .mic-orb {

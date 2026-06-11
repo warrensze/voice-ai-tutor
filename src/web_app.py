@@ -132,6 +132,8 @@ async def _send_turn_from_worker(
     question: str,
     *,
     subject: str | None,
+    course: str | None,
+    source_mode: str | None,
     speak: bool,
     stop_event: threading.Event,
 ):
@@ -150,6 +152,8 @@ async def _send_turn_from_worker(
             for event in runtime.stream_ui_turn(
                 question,
                 subject=subject,
+                course=course,
+                source_mode=source_mode,
                 speak=speak,
                 stop_event=stop_event,
                 timeout_seconds=UI_TURN_TIMEOUT_SECONDS,
@@ -329,6 +333,9 @@ async def upload_asset(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     subject: str = Form("english"),
+    course: str = Form(""),
+    source_role: str = Form("textbook"),
+    topic_tags: str = Form(""),
     title: str = Form(""),
     notes: str = Form(""),
 ):
@@ -342,6 +349,9 @@ async def upload_asset(
             tmp_path,
             original_filename=file.filename,
             subject=subject,
+            course=course,
+            source_role=source_role,
+            topic_tags=topic_tags,
             title=title,
             notes=notes,
         )
@@ -477,6 +487,8 @@ async def chat_websocket(websocket: WebSocket):
             runtime = _runtime_for_settings()
             speak = bool(payload.get("speak", load_user_settings().speak_responses))
             subject = str(payload.get("subject") or "").strip().lower() or None
+            course = str(payload.get("course") or "").strip().lower() or None
+            source_mode = str(payload.get("source_mode") or "").strip().lower() or None
             stop_event = threading.Event()
             _register_turn_event(stop_event)
             await websocket.send_json({"type": "status", "status": "thinking"})
@@ -486,6 +498,8 @@ async def chat_websocket(websocket: WebSocket):
                     runtime,
                     question,
                     subject=subject,
+                    course=course,
+                    source_mode=source_mode,
                     speak=speak,
                     stop_event=stop_event,
                 )

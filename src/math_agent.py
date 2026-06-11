@@ -14,6 +14,9 @@ When possible, cite page labels in parentheses (for example, (page 11)).
 
 Requested page range: {page_range}
 
+Study set:
+{study_context}
+
 Conversation memory:
 {memory_context}
 

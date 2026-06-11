@@ -45,11 +45,22 @@ def format_source(documents) -> str:
 
     sections = []
     for index, document in enumerate(documents, start=1):
-        page_label = document.metadata.get("page_label") or str(
-            document.metadata.get("page", "unknown")
+        metadata = document.metadata or {}
+        page_label = metadata.get("page_label") or str(
+            metadata.get("page", "unknown")
         )
+        title = metadata.get("title") or metadata.get("source_file") or "source"
+        course_label = metadata.get("course_label") or ""
+        source_role = str(metadata.get("source_role") or "").replace("_", " ")
+        descriptor_parts = [str(title)]
+        if course_label:
+            descriptor_parts.append(str(course_label))
+        if source_role:
+            descriptor_parts.append(source_role)
+        descriptor = " | ".join(descriptor_parts)
         sections.append(
-            f"Source {index} | page {page_label}\n{document.page_content.strip()}"
+            f"Source {index} | {descriptor} | page {page_label}\n"
+            f"{document.page_content.strip()}"
         )
 
     return "\n\n".join(sections)
